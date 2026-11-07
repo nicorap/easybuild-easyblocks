@@ -46,7 +46,7 @@ from easybuild.easyblocks import VERSION as EASYBLOCKS_VERSION
 from easybuild.framework.easyblock import EasyBlock
 from easybuild.framework.easyconfig import CUSTOM
 from easybuild.tools.build_log import EasyBuildError, print_warning
-from easybuild.tools.config import build_option, source_paths
+from easybuild.tools.config import build_option, log_path, source_paths
 from easybuild.tools.filetools import adjust_permissions, copy_file, mkdir, read_file, remove_dir, remove_file
 from easybuild.tools.filetools import symlink, write_file
 from easybuild.tools.run import run_shell_cmd
@@ -712,10 +712,17 @@ class ContainerStack(EasyBlock):
         self.write_manifest(manifest_path, results)
 
     def permissions_step(self):
-        """Standard permissions, then make the installed files read-only (directories stay writable)."""
+        """
+        Standard permissions, then make the installed files read-only (directories stay writable).
+        EasyBuild's own log dir (installdir/easybuild) stays writable: it archives the recipe there on promotion.
+        """
         super().permissions_step()
-        adjust_permissions(self.installdir, stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH, add=False, onlyfiles=True,
-                           recursive=True)
+        logdir = os.path.normpath(os.path.join(self.installdir, log_path(ec=self.cfg)))
+        for root, dirs, files in os.walk(self.installdir):
+            dirs[:] = [name for name in dirs if os.path.normpath(os.path.join(root, name)) != logdir]
+            for name in files:
+                adjust_permissions(os.path.join(root, name), stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH, add=False,
+                                   recursive=False)
 
     def make_module_step(self, fake=False):
         """Generate the module file; warn when --module-only --force skipped the manifest/digest check."""

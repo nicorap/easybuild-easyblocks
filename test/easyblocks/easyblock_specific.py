@@ -1633,6 +1633,21 @@ class EasyBlockSpecificTest(TestCase):
         eb.make_installdir()
         self.assertEqual(os.listdir(eb.installdir), [])
 
+    def test_containerstack_log_dir_writable(self):
+        """permissions_step leaves installdir/easybuild writable, so EasyBuild can archive the recipe on promotion."""
+        eb, _ = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        write_file(os.path.join(eb.installdir, 'manifest.json'), '{}')
+        archived = os.path.join(eb.installdir, 'easybuild', 'tiny-container-1.0.eb')
+        write_file(archived, 'hidden = True\n')
+        eb.permissions_step()
+        self.assertTrue(os.access(archived, os.W_OK))
+        if os.geteuid() != 0:
+            for rel in ('image.sif', 'manifest.json'):
+                self.assertFalse(os.access(os.path.join(eb.installdir, rel), os.W_OK), rel)
+
     def test_containerstack_module_extra(self):
         """The module sets <PREFIX>_SQSH, <PREFIX>_SIF and <PREFIX>_DIGEST."""
         eb, img = self._cs_easyblock()
