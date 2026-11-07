@@ -66,6 +66,7 @@ CHUNK = 1 << 20
 FORMATS = ('sqsh', 'sif')
 POLICIES = ('auto', 'apptainer', 'enroot', 'pyxis')
 MANIFEST = 'manifest.json'
+SMOKE_DIR = 'smoke'
 # paths an Apptainer sandbox adds to the image rootfs; removed before making the enroot .sqsh
 APPTAINER_PATHS = ('.singularity.d', '.exec', '.run', '.shell', '.test', 'environment', 'singularity')
 ENROOT_RC_BODY = '''mkdir -p "%(workdir)s" 2> /dev/null
@@ -642,8 +643,11 @@ class ContainerStack(EasyBlock):
             prefix = 'CS_RUNTIME=enroot ENROOT_DATA_PATH=%s' % shlex.quote(os.path.join(self.builddir, 'enroot-data'))
         return '%s %s sh -c %s' % (prefix, runner, shlex.quote(command))
 
-    def run_smoke_tests(self):
-        """Run every smoke test in every format; returns the results, raises on the first failure."""
+    def run_smoke_tests(self, log_dir=None):
+        """
+        Run every smoke test in every format; returns the results, raises on the first failure.
+        With log_dir, each test's output goes to <log_dir>/<n>-<kind>.<format>.log (n: position in smoke_tests).
+        """
         tests = [tuple(test) for test in self.cfg['smoke_tests']]
         gpu_tests = [cmd for kind, cmd in tests if kind == 'gpu']
         require_gpu = self.cfg['require_gpu_tests']
@@ -658,7 +662,7 @@ class ContainerStack(EasyBlock):
         results = []
         for fmt in self.cfg['formats']:
             try:
-                for kind, command in tests:
+                for idx, (kind, command) in enumerate(tests, start=1):
                     result = {'format': fmt, 'kind': kind, 'command': command,
                               'date': time.strftime('%Y-%m-%dT%H:%M:%S')}
                     if kind == 'gpu' and not gpu:
@@ -666,6 +670,8 @@ class ContainerStack(EasyBlock):
                     else:
                         start = time.time()
                         res = run_shell_cmd(self._smoke_cmd(fmt, command), fail_on_error=False)
+                        if log_dir:
+                            write_file(os.path.join(log_dir, '%d-%s.%s.log' % (idx, kind, fmt)), res.output or '')
                         if res.exit_code != 0:
                             raise EasyBuildError("ContainerStack: %s smoke test failed in %s (exit %s): %s\n%s",
                                                  kind, fmt, res.exit_code, command, (res.output or '')[-2000:])
@@ -727,9 +733,9 @@ class ContainerStack(EasyBlock):
         if build_option('module_only') or self.cfg['module_only'] or build_option('sanity_check_only') or self.skip:
             self.check_existing_manifest(manifest_path)
             if build_option('sanity_check_only'):
-                self.run_smoke_tests()
+                self.run_smoke_tests()    # no smoke/ logs: the install is read-only by now
             return
-        results = self.run_smoke_tests()
+        results = self.run_smoke_tests(log_dir=os.path.join(self.installdir, SMOKE_DIR))
         self.write_manifest(manifest_path, results)
 
     def permissions_step(self):

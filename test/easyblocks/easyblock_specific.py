@@ -1617,6 +1617,24 @@ class EasyBlockSpecificTest(TestCase):
         self.assertEqual(len(manifest['smoke_tests']), 4)
         self.assertEqual(manifest['runtimes']['apptainer'], 'fake 1.0')
 
+    def test_containerstack_smoke_logs(self):
+        """A passing sanity check leaves each smoke test's output per format in smoke/, read-only like the rest."""
+        EasyBlock.sanity_check_step = lambda self, *args, **kwargs: None
+        eb, _ = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        self._cs_gpu(True)
+        eb.sanity_check_step()
+        smoke = os.path.join(eb.installdir, 'smoke')
+        logs = ['1-cpu.sif.log', '1-cpu.sqsh.log', '2-gpu.sif.log', '2-gpu.sqsh.log']
+        self.assertEqual(sorted(os.listdir(smoke)), logs)
+        for log in logs:
+            self.assertEqual(read_file(os.path.join(smoke, log)), 'fake 1.0\n', log)
+        eb.permissions_step()
+        if os.geteuid() != 0:
+            self.assertFalse(os.access(os.path.join(smoke, logs[0]), os.W_OK))
+
     def test_containerstack_module_only(self):
         """--module-only (promotion) checks the existing manifest and never re-runs or rewrites anything."""
         EasyBlock.sanity_check_step = lambda self, *args, **kwargs: None
