@@ -371,6 +371,27 @@ def enroot_files(image_config, provenance):
     return {'etc/fstab': fstab, 'etc/environment': environment, 'etc/rc': rc, 'etc/rc.local': ENROOT_RC_LOCAL}
 
 
+def rootfs_path(rootfs, path):
+    """
+    Host path of image path 'path' in rootfs. Refuses a path whose parent directory resolves outside rootfs:
+    through '..' or through an image symlink (an absolute one would resolve on the host).
+    """
+    root = os.path.realpath(rootfs)
+    target = os.path.normpath(os.path.join(root, path.lstrip('/')))
+    if target != root and os.path.commonpath([root, os.path.realpath(os.path.dirname(target))]) != root:
+        raise EasyBuildError("ContainerStack: image path %r leads outside the image rootfs %s; refusing it",
+                             path, rootfs)
+    return target
+
+
+def remove_nofollow(path):
+    """Remove a file, symlink or directory if present, never following a symlink."""
+    if os.path.islink(path) or os.path.isfile(path):
+        os.remove(path)
+    elif os.path.isdir(path):
+        remove_dir(path)
+
+
 def det_squash_options(configured=None):
     """mksquashfs options: easyconfig value, $ENROOT_SQUASH_OPTIONS, the system enroot.conf, enroot's default."""
     if configured:
@@ -581,18 +602,16 @@ class ContainerStack(EasyBlock):
         rootfs = os.path.join(self.builddir, 'rootfs')
         run_shell_cmd(env + 'apptainer build --force --sandbox %s oci:%s' % (shlex.quote(rootfs), shlex.quote(layout)))
         for rel in APPTAINER_PATHS:
-            path = os.path.join(rootfs, rel)
-            if os.path.islink(path) or os.path.isfile(path):
-                os.remove(path)
-            elif os.path.isdir(path):
-                remove_dir(path)
+            remove_nofollow(os.path.join(rootfs, rel))
         with open(blob_path(self.blobs_dir, self.manifest['config']['digest']), 'rb') as fh:
             config = json.loads(fh.read().decode())
         provenance = 'containerstack://%s@%s' % (self.cfg['image'], self.digest)
         for rel, text in enroot_files(config, provenance).items():
-            write_file(os.path.join(rootfs, rel), text)
+            path = rootfs_path(rootfs, rel)
+            remove_nofollow(path)    # an image symlink here must be replaced, not written through
+            write_file(path, text)
         workdir = (config.get('config') or {}).get('WorkingDir') or '/'
-        mkdir(os.path.join(rootfs, workdir.lstrip('/')), parents=True)
+        mkdir(rootfs_path(rootfs, workdir), parents=True)
         sqsh = os.path.join(self.builddir, 'image.sqsh')
         run_shell_cmd('mksquashfs %s %s -noappend -all-root -no-progress %s'
                       % (shlex.quote(rootfs), shlex.quote(sqsh), det_squash_options(self.cfg['squash_options'])))

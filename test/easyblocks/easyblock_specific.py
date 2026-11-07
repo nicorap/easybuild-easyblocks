@@ -165,7 +165,7 @@ class _CSFakeRegistry:
         return [r for r in self.requests if '/blobs/' in r]
 
 
-def _cs_tiny_image(registry, tag='1.0'):
+def _cs_tiny_image(registry, tag='1.0', workdir='/work'):
     """Push a one-layer image (file etc/greeting) and a multi-arch index to the fake registry; return digests."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode='w:gz') as tar:
@@ -176,7 +176,7 @@ def _cs_tiny_image(registry, tag='1.0'):
     layer = buf.getvalue()
     config = json.dumps({'architecture': 'amd64', 'os': 'linux', 'rootfs': {'type': 'layers', 'diff_ids': []},
                          'config': {'Env': ['PATH=/usr/bin:/bin', 'GREETING=hello world'], 'Cmd': ['sh'],
-                                    'WorkingDir': '/work'}}).encode()
+                                    'WorkingDir': workdir}}).encode()
     layer_digest = registry.add_blob(layer)
     config_digest = registry.add_blob(config)
     manifest = {'schemaVersion': 2, 'mediaType': CS_OCI_MANIFEST,
@@ -1106,11 +1106,11 @@ class EasyBlockSpecificTest(TestCase):
         self.assertEqual(containerstack.env_var_prefix('PyTorch-container'), 'PYTORCHCONTAINER')
         self.assertEqual(containerstack.env_var_prefix('vLLM-container'), 'VLLMCONTAINER')
 
-    def _cs_registry(self):
+    def _cs_registry(self, workdir='/work'):
         """Fake registry with the tiny image, and a client for it."""
         reg = _CSFakeRegistry()
         self.addCleanup(reg.close)
-        img = _cs_tiny_image(reg)
+        img = _cs_tiny_image(reg, workdir=workdir)
         return reg, img, containerstack.RegistryClient(reg.address, reg.repo, scheme='http')
 
     def test_containerstack_registry_token_flow(self):
@@ -1414,9 +1414,9 @@ class EasyBlockSpecificTest(TestCase):
         return RunShellCmdResult(cmd=cmd, exit_code=code, output=out, stderr=None, work_dir=None, out_file=None,
                                  err_file=None, cmd_sh=None, thread_id=None, task_id=None)
 
-    def _cs_easyblock(self, extra=''):
+    def _cs_easyblock(self, extra='', workdir='/work'):
         """ContainerStack instance for the tiny image in a fake registry, with mocked commands and paths."""
-        reg, img, _ = self._cs_registry()
+        reg, img, _ = self._cs_registry(workdir=workdir)
         ec_file = os.path.join(self.tmpdir, 'tiny-container-1.0.eb')
         write_file(ec_file, textwrap.dedent("""
             easyblock = 'ContainerStack'
@@ -1487,6 +1487,46 @@ class EasyBlockSpecificTest(TestCase):
         eb.fetch_step()
         eb.build_step()
         self.assertEqual([c for c in self.cs_calls if 'mksquashfs' in c or '--sandbox' in c], [])
+
+    def test_containerstack_rootfs_writes_stay_inside(self):
+        """enroot's /etc files replace image symlinks instead of writing through them; no write escapes the rootfs."""
+        outside = os.path.join(self.tmpdir, 'host')
+        write_file(os.path.join(outside, 'rc'), 'host file\n')
+        plant, seen = {}, {}
+
+        def run(cmd, **kwargs):
+            if cmd.startswith('mksquashfs '):
+                rc = os.path.join(cmd.split()[1], 'etc', 'rc')
+                seen['rc'] = (os.path.islink(rc), os.path.isfile(rc))
+            res = self._cs_fake_run(cmd, **kwargs)
+            sandbox = re.search(r'--sandbox (\S+) ', cmd)
+            if sandbox:
+                for rel, dest in plant.items():
+                    path = os.path.join(sandbox.group(1), rel)
+                    if os.path.isdir(path):
+                        remove_dir(path)
+                    os.symlink(dest, path)
+            return res
+
+        eb, _ = self._cs_easyblock("formats = ['sqsh']\n")
+        eb.fetch_step()
+        containerstack.run_shell_cmd = run
+        plant = {'etc/rc': os.path.join(outside, 'rc')}
+        eb.build_step()
+        self.assertEqual(read_file(os.path.join(outside, 'rc')), 'host file\n')
+        self.assertEqual(seen['rc'], (False, True))
+        self.assertTrue(self.cs_squashed['rc'].startswith('# enroot-provenance: '))
+        # an image whose /etc is an absolute symlink would resolve on the host: refused
+        plant = {'etc': outside}
+        self.assertRaisesRegex(EasyBuildError, "outside the image rootfs", eb.build_step)
+        self.assertEqual(sorted(os.listdir(outside)), ['rc'])
+        self.assertEqual(read_file(os.path.join(outside, 'rc')), 'host file\n')
+        remove_dir(os.path.join(eb.builddir, 'rootfs'))    # apptainer build --force would replace it
+        # a WorkingDir with '..' (rootfs is <tmpdir>/build/rootfs) would make the mkdir escape: refused
+        eb, _ = self._cs_easyblock("formats = ['sqsh']\n", workdir='/../../x')
+        eb.fetch_step()
+        self.assertRaisesRegex(EasyBuildError, "outside the image rootfs", eb.build_step)
+        self.assertFalse(os.path.exists(os.path.join(self.tmpdir, 'x')))
 
     def test_containerstack_free_space(self):
         """build_step refuses to start without min_free_space_factor x the image size free."""
