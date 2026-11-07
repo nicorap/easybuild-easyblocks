@@ -468,6 +468,11 @@ def suite(loader):
         elif eb_fn == 'systemmpi.py':
             # use OpenMPI as name when testing SystemMPI easyblock
             innertest = make_inner_test(easyblock, name='OpenMPI', version='system')
+        elif eb_fn == 'containerstack.py':
+            # ContainerStack needs an image and a manifest digest for the host architecture
+            extra_txt = "image = 'example.org/team/tiny'\n"
+            extra_txt += "digests = {'x86_64': 'sha256:%s', 'aarch64': 'sha256:%s'}" % ('0' * 64, '1' * 64)
+            innertest = make_inner_test(easyblock, name='tiny-container', extra_txt=extra_txt)
         elif eb_fn == 'craytoolchain.py':
             # make sure that a (known) PrgEnv is included as a dependency
             extra_txt = 'dependencies = [("PrgEnv-gnu/1.2.3", EXTERNAL_MODULE)]'
