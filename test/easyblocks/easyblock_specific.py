@@ -59,6 +59,7 @@ from easybuild.easyblocks.generic.cmakemake import det_cmake_version
 from easybuild.easyblocks.generic.toolchain import Toolchain
 from easybuild.easyblocks.tensorflow import det_binutils_bin_path
 from easybuild.framework.easyblock import EasyBlock, get_easyblock_instance
+from easybuild.framework.easyconfig import easyconfig
 from easybuild.framework.easyconfig.easyconfig import process_easyconfig
 from easybuild.tools import config
 from easybuild.tools.build_log import EasyBuildError
@@ -1383,6 +1384,223 @@ class EasyBlockSpecificTest(TestCase):
         res = subprocess.run([cs_run, 'sh', '-c', 'true'], capture_output=True, text=True,
                              env={'PATH': fakebin + ':/usr/bin:/bin', 'CS_GPU_DEVICE': '/nonexistent'})
         self.assertEqual(res.stdout.splitlines()[:5], ['TOOL apptainer', 'ARG exec', 'ARG ' + sif, 'ARG sh', 'ARG -c'])
+
+    def _cs_fake_run(self, cmd, **kwargs):
+        """Stand-in for run_shell_cmd: records commands and fakes the files Apptainer/mksquashfs would make."""
+        self.cs_calls.append(cmd)
+        sandbox = re.search(r'apptainer build --force --sandbox (\S+) oci:', cmd)
+        image = re.search(r'apptainer build --force (\S+\.sif) oci:', cmd)
+        squash = re.search(r'^mksquashfs (\S+) (\S+) ', cmd)
+        if sandbox:
+            rootfs = sandbox.group(1)
+            for sub in ('.singularity.d/env', 'etc', 'usr/bin'):
+                mkdir(os.path.join(rootfs, sub), parents=True)
+            for name in ('.exec', '.run', '.shell', '.test'):
+                write_file(os.path.join(rootfs, name), '')
+            os.symlink('.singularity.d/env', os.path.join(rootfs, 'environment'))
+            os.symlink('.singularity.d', os.path.join(rootfs, 'singularity'))
+        elif image:
+            write_file(image.group(1), 'sif image')
+        elif squash:
+            rootfs = squash.group(1)
+            self.cs_squashed = {'top': sorted(os.listdir(rootfs)),
+                                'rc': read_file(os.path.join(rootfs, 'etc', 'rc')),
+                                'environment': read_file(os.path.join(rootfs, 'etc', 'environment'))}
+            write_file(squash.group(2), 'sqsh image')
+        code, out = 0, 'fake 1.0\n'
+        for pattern, exit_code in self.cs_fail.items():
+            if pattern in cmd:
+                code, out = exit_code, 'boom\n'
+        return RunShellCmdResult(cmd=cmd, exit_code=code, output=out, stderr=None, work_dir=None, out_file=None,
+                                 err_file=None, cmd_sh=None, thread_id=None, task_id=None)
+
+    def _cs_easyblock(self, extra=''):
+        """ContainerStack instance for the tiny image in a fake registry, with mocked commands and paths."""
+        reg, img, _ = self._cs_registry()
+        ec_file = os.path.join(self.tmpdir, 'tiny-container-1.0.eb')
+        write_file(ec_file, textwrap.dedent("""
+            easyblock = 'ContainerStack'
+            name = 'tiny-container'
+            version = '1.0'
+            homepage = 'https://example.org'
+            description = 'ContainerStack test stack'
+            toolchain = SYSTEM
+            image = '%s/%s'
+            registry_scheme = 'http'
+            digests = {'x86_64': '%s'}
+            launchers = {'greet': 'cat /etc/greeting'}
+            site_env = {'OMP_NUM_THREADS': '1'}
+            smoke_tests = [('cpu', 'test -f /etc/greeting'), ('gpu', 'nvidia-smi -L')]
+            squash_options = '-noI -noD'
+        """) % (reg.address, reg.repo, img['manifest']) + extra)
+        easyconfig._easyconfigs_cache.clear()    # same path, new content: parse it again
+        eb = get_easyblock_instance(process_easyconfig(ec_file)[0])
+        eb.builddir = os.path.join(self.tmpdir, 'build')
+        mkdir(eb.builddir, parents=True)
+        eb.installdir = os.path.join(self.tmpdir, 'install')
+        containerstack.host_arch_key = lambda: 'x86_64'
+        containerstack.source_paths = lambda: [os.path.join(self.tmpdir, 'sources')]
+        containerstack.run_shell_cmd = self._cs_fake_run
+        return eb, img
+
+    def _cs_gpu(self, present):
+        """Point the GPU check (Python and wrappers) at an existing or a missing device file."""
+        path = os.path.join(self.tmpdir, 'nvidia0' if present else 'no-gpu')
+        if present:
+            write_file(path, '')
+        os.environ['CS_GPU_DEVICE'] = path
+
+    def test_containerstack_validation(self):
+        """Bad easyconfig values fail early with a message naming the parameter."""
+        cases = [("formats = ['tar']\n", "unknown format"), ("formats = []\n", "unknown format"),
+                 ("launch_policy = 'docker'\n", "launch_policy must be one of"),
+                 ("launchers = {'../x': 'ls'}\n", "invalid launcher name"),
+                 ("site_env = {'A': 1}\n", "site_env"), ("site_env = {'1A': 'x'}\n", "site_env"),
+                 ("smoke_tests = [('tpu', 'true')]\n", "smoke test"),
+                 ("image = 'nvcr.io/nvidia/pytorch:26.10'\n", "must not contain a tag"),
+                 ("image = None\n", "'image' is required")]
+        for extra, msg in cases:
+            eb, _ = self._cs_easyblock(extra)
+            self.assertRaisesRegex(EasyBuildError, msg, eb.fetch_step)
+
+    def test_containerstack_build_step(self):
+        """build_step makes the .sif from the verified layout and a clean enroot-style .sqsh, never appending."""
+        eb, img = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        layout = os.path.join(eb.builddir, 'oci-layout')
+        rootfs = os.path.join(eb.builddir, 'rootfs')
+        sif = [c for c in self.cs_calls if 'apptainer build --force %s/image.sif oci:%s' % (eb.builddir, layout) in c]
+        self.assertEqual(len(sif), 1)
+        self.assertIn('APPTAINER_TMPDIR=%s/tmp' % eb.builddir, sif[0])
+        squash = [c for c in self.cs_calls if c.startswith('mksquashfs ')]
+        self.assertEqual(squash, ['mksquashfs %s %s/image.sqsh -noappend -all-root -no-progress -noI -noD'
+                                  % (rootfs, eb.builddir)])
+        self.assertEqual(self.cs_squashed['top'], ['etc', 'usr', 'work'])
+        self.assertTrue(self.cs_squashed['rc'].startswith('# enroot-provenance: containerstack://%s@%s\n'
+                                                          % (eb.cfg['image'], img['manifest'])))
+        self.assertEqual(self.cs_squashed['environment'], 'PATH=/usr/bin:/bin\nGREETING=hello world\n')
+        self.assertFalse(os.path.exists(rootfs))
+        # only the requested formats are built
+        self.cs_calls = []
+        eb, _ = self._cs_easyblock("formats = ['sif']\n")
+        eb.fetch_step()
+        eb.build_step()
+        self.assertEqual([c for c in self.cs_calls if 'mksquashfs' in c or '--sandbox' in c], [])
+
+    def test_containerstack_free_space(self):
+        """build_step refuses to start without min_free_space_factor x the image size free."""
+        eb, _ = self._cs_easyblock()
+        eb.fetch_step()
+        containerstack.disk_free = lambda path: 10
+        self.assertRaisesRegex(EasyBuildError, r"GiB free in .*, need .* GiB \(3x the image size\)", eb.build_step)
+
+    def test_containerstack_install_step(self):
+        """install_step copies images and writes wrappers and site.env, but no manifest yet."""
+        eb, _ = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        for rel in ('image.sif', 'image.sqsh', 'bin/greet', 'bin/.cs-run', 'etc/site.env'):
+            self.assertTrue(os.path.isfile(os.path.join(eb.installdir, rel)), rel)
+        self.assertTrue(os.access(os.path.join(eb.installdir, 'bin', 'greet'), os.X_OK))
+        self.assertEqual(read_file(os.path.join(eb.installdir, 'etc', 'site.env')), 'OMP_NUM_THREADS=1\n')
+        self.assertIn('cmd=(cat /etc/greeting)', read_file(os.path.join(eb.installdir, 'bin', 'greet')))
+        self.assertIn('cmd=()', read_file(os.path.join(eb.installdir, 'bin', '.cs-run')))
+        self.assertFalse(os.path.exists(os.path.join(eb.installdir, 'manifest.json')))
+
+    def test_containerstack_smoke_tests(self):
+        """Every smoke test runs in every format via bin/.cs-run; a missing GPU fails unless explicitly allowed."""
+        eb, _ = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        self._cs_gpu(False)
+        self.cs_calls = []
+        self.assertRaisesRegex(EasyBuildError, "GPU smoke test 'nvidia-smi -L' cannot run: no GPU", eb.run_smoke_tests)
+        self.assertEqual([c for c in self.cs_calls if '.cs-run' in c], [])    # fails before running anything
+        self._cs_gpu(True)
+        results = eb.run_smoke_tests()
+        self.assertEqual([(r['format'], r['kind'], r['result']) for r in results],
+                         [('sqsh', 'cpu', 'pass'), ('sqsh', 'gpu', 'pass'), ('sif', 'cpu', 'pass'),
+                          ('sif', 'gpu', 'pass')])
+        runner = os.path.join(eb.installdir, 'bin', '.cs-run')
+        self.assertTrue(any(c.startswith('CS_RUNTIME=apptainer %s sh -c ' % runner) for c in self.cs_calls))
+        self.assertTrue(any(c.startswith('CS_RUNTIME=enroot ENROOT_DATA_PATH=') for c in self.cs_calls))
+        self.cs_fail = {'test -f /etc/greeting': 1}
+        self.assertRaisesRegex(EasyBuildError, r"cpu smoke test failed in sqsh \(exit 1\): test -f /etc/greeting",
+                               eb.run_smoke_tests)
+        self.cs_fail = {}
+        eb, _ = self._cs_easyblock("require_gpu_tests = False\n")
+        eb.fetch_step()
+        self._cs_gpu(False)
+        results = eb.run_smoke_tests()
+        self.assertEqual(sorted({r['result'] for r in results if r['kind'] == 'gpu'}), ['not-run: no GPU'])
+
+    def test_containerstack_no_manifest_on_failure(self):
+        """manifest.json appears only after every smoke test passed, and records what was installed."""
+        EasyBlock.sanity_check_step = lambda self, *args, **kwargs: None
+        eb, img = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        self._cs_gpu(True)
+        manifest_path = os.path.join(eb.installdir, 'manifest.json')
+        self.cs_fail = {'nvidia-smi -L': 3}
+        self.assertRaisesRegex(EasyBuildError, "smoke test failed", eb.sanity_check_step)
+        self.assertFalse(os.path.exists(manifest_path))
+        self.cs_fail = {}
+        eb.sanity_check_step()
+        manifest = json.loads(read_file(manifest_path))
+        self.assertEqual((manifest['digest'], manifest['arch'], manifest['layers']),
+                         (img['manifest'], 'x86_64', [img['layer']]))
+        self.assertEqual(sorted(manifest['files']), ['image.sif', 'image.sqsh'])
+        self.assertEqual(len(manifest['files']['image.sif']['sha256']), 71)
+        self.assertEqual(len(manifest['smoke_tests']), 4)
+        self.assertEqual(manifest['runtimes']['apptainer'], 'fake 1.0')
+
+    def test_containerstack_module_only(self):
+        """--module-only (promotion) checks the existing manifest and never re-runs or rewrites anything."""
+        EasyBlock.sanity_check_step = lambda self, *args, **kwargs: None
+        eb, img = self._cs_easyblock()
+        manifest_path = os.path.join(eb.installdir, 'manifest.json')
+        update_build_option('module_only', True)
+        self.assertRaisesRegex(EasyBuildError, "has no manifest.json", eb.sanity_check_step)
+        write_file(manifest_path, json.dumps({'digest': 'sha256:' + 'b' * 64}))
+        self.assertRaisesRegex(EasyBuildError, "built from sha256:b+ but the recipe pins", eb.sanity_check_step)
+        write_file(manifest_path, json.dumps({'digest': img['manifest']}))
+        self.cs_calls = []
+        eb.sanity_check_step()
+        self.assertEqual(self.cs_calls, [])
+        self.assertEqual(json.loads(read_file(manifest_path)), {'digest': img['manifest']})
+        # --sanity-check-only re-runs the smoke tests but still never rewrites the manifest
+        update_build_option('module_only', False)
+        update_build_option('sanity_check_only', True)
+        self._cs_gpu(True)
+        eb.sanity_check_step()
+        self.assertTrue(any('.cs-run' in c for c in self.cs_calls))
+        self.assertEqual(json.loads(read_file(manifest_path)), {'digest': img['manifest']})
+
+    def test_containerstack_rebuild_readonly(self):
+        """Installed files become read-only, and --rebuild can still replace the install."""
+        eb, _ = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        eb.permissions_step()
+        if os.geteuid() != 0:
+            self.assertFalse(os.access(os.path.join(eb.installdir, 'image.sif'), os.W_OK))
+        eb.make_installdir()
+        self.assertEqual(os.listdir(eb.installdir), [])
+
+    def test_containerstack_module_extra(self):
+        """The module sets <PREFIX>_SQSH, <PREFIX>_SIF and <PREFIX>_DIGEST."""
+        eb, img = self._cs_easyblock()
+        txt = eb.make_module_extra()
+        for var, value in (('TINYCONTAINER_SQSH', os.path.join(eb.installdir, 'image.sqsh')),
+                           ('TINYCONTAINER_SIF', os.path.join(eb.installdir, 'image.sif')),
+                           ('TINYCONTAINER_DIGEST', img['manifest'])):
+            self.assertTrue(re.search(r'%s.*%s' % (var, re.escape(value)), txt), (var, txt))
 
 
 def suite(loader):

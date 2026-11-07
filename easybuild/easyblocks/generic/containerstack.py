@@ -465,3 +465,258 @@ def render_wrapper(name, version, digest, command, policy, binds):
         'mounts': ' '.join(shlex.quote(m) for m in mounts),
         'cmd': ' '.join(shlex.quote(w) for w in shlex.split(command)),
     }
+
+
+class ContainerStack(EasyBlock):
+    """Deploy a digest-pinned OCI image as a module, in enroot/pyxis (.sqsh) and Apptainer (.sif) formats."""
+
+    @staticmethod
+    def extra_options(extra_vars=None):
+        """Easyconfig parameters of ContainerStack."""
+        extra_vars = EasyBlock.extra_options(extra_vars)
+        extra_vars.update({
+            'binds': [[], "Host paths to mount in the container ('path' or 'src:dst')", CUSTOM],
+            'digests': [{}, "Per-architecture manifest digests: {'x86_64': 'sha256:...', 'aarch64': 'sha256:...'}",
+                        CUSTOM],
+            'formats': [['sqsh', 'sif'], "Formats to produce: 'sqsh' (enroot/pyxis) and/or 'sif' (Apptainer)",
+                        CUSTOM],
+            'image': [None, "Image reference without tag or digest, e.g. 'nvcr.io/nvidia/pytorch'", CUSTOM],
+            'launch_policy': ['auto', "Default wrapper runtime: auto, apptainer, enroot or pyxis", CUSTOM],
+            'launchers': [{}, "Wrappers in bin/: {'wrapper name': 'command inside the container'}", CUSTOM],
+            'min_free_space_factor': [3, "Free space needed in the build directory, as a multiple of the image size",
+                                      CUSTOM],
+            'registry_scheme': ['https', "Registry URL scheme ('http' only for local test registries)", CUSTOM],
+            'require_gpu_tests': [None, "Fail when 'gpu' smoke tests cannot run (default: True if any exist)",
+                                  CUSTOM],
+            'site_env': [{}, "Environment variables set in the container: {'NAME': 'value'}", CUSTOM],
+            'smoke_tests': [[], "Run in every format during the sanity check: [('cpu' or 'gpu', 'command'), ...]",
+                            CUSTOM],
+            'squash_options': [None, "mksquashfs options (default: $ENROOT_SQUASH_OPTIONS or enroot.conf)", CUSTOM],
+        })
+        return extra_vars
+
+    def __init__(self, *args, **kwargs):
+        """Initialise; easyconfig values are validated when first needed, not here."""
+        super().__init__(*args, **kwargs)
+        self.digest = None
+        self.manifest = None
+        self.blobs_dir = None
+        self.registry = self.repo = self.arch_key = None
+
+    def _validate(self):
+        """Check the easyconfig and resolve image, architecture and digest."""
+        if not self.cfg['image']:
+            raise EasyBuildError("ContainerStack: easyconfig parameter 'image' is required")
+        self.registry, self.repo = split_image(self.cfg['image'])
+        self.arch_key = host_arch_key()
+        self.digest = select_digest(self.cfg['digests'], self.arch_key)
+        formats = self.cfg['formats'] or []
+        if not formats or any(fmt not in FORMATS for fmt in formats):
+            raise EasyBuildError("ContainerStack: unknown format in %s (use 'sqsh' and/or 'sif')", formats)
+        if self.cfg['launch_policy'] not in POLICIES:
+            raise EasyBuildError("ContainerStack: launch_policy must be one of %s, not %r",
+                                 ', '.join(POLICIES), self.cfg['launch_policy'])
+        for name in self.cfg['launchers']:
+            if not re.match(r'^[A-Za-z0-9][A-Za-z0-9._+-]*$', name):
+                raise EasyBuildError("ContainerStack: invalid launcher name %r", name)
+        for key, value in self.cfg['site_env'].items():
+            if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', key) or not isinstance(value, str) or '\n' in value:
+                raise EasyBuildError("ContainerStack: site_env needs NAME: 'single-line string', got %r: %r",
+                                     key, value)
+        for test in self.cfg['smoke_tests']:
+            if not (isinstance(test, (list, tuple)) and len(test) == 2 and test[0] in ('cpu', 'gpu')):
+                raise EasyBuildError("ContainerStack: smoke test must be ('cpu' or 'gpu', 'command'): %r", test)
+
+    def _blobs_dir(self):
+        """Shared blob store <sourcepath>/<letter>/<name>/oci/blobs/sha256 (first source path that has one)."""
+        name = self.cfg['name']
+        rel = os.path.join(name[0].lower(), name, 'oci', 'blobs', 'sha256')
+        paths = source_paths()
+        for path in paths:
+            if os.path.isdir(os.path.join(path, rel)):
+                return os.path.join(path, rel)
+        return os.path.join(paths[0], rel)
+
+    def fetch_step(self, skip_checksums=False):
+        """Fetch the image's manifest, config and layers by digest, verifying every blob."""
+        self._validate()
+        super().fetch_step(skip_checksums=skip_checksums)
+        self.blobs_dir = self._blobs_dir()
+        if self.dry_run:
+            self.dry_run_msg("Fetching %s/%s@%s into %s\n", self.registry, self.repo, self.digest, self.blobs_dir)
+            return
+        client = RegistryClient(self.registry, self.repo, scheme=self.cfg['registry_scheme'])
+        self.manifest = fetch_oci_blobs(client, self.digest, self.blobs_dir)
+
+    def configure_step(self):
+        """Nothing to configure."""
+        pass
+
+    def build_step(self):
+        """Build the requested formats from the verified OCI layout, inside the build directory."""
+        self.manifest = verify_oci_blobs(self.blobs_dir, self.digest)
+        need = sum(layer['size'] for layer in self.manifest['layers']) * self.cfg['min_free_space_factor']
+        free = disk_free(self.builddir)
+        if free < need:
+            raise EasyBuildError("ContainerStack: %.1f GiB free in %s, need %.1f GiB (%dx the image size)",
+                                 free / 2.0 ** 30, self.builddir, need / 2.0 ** 30, self.cfg['min_free_space_factor'])
+        layout = os.path.join(self.builddir, 'oci-layout')
+        write_oci_layout(layout, self.blobs_dir, self.digest, self.manifest.get('mediaType', OCI_MANIFEST))
+        tmp = os.path.join(self.builddir, 'tmp')
+        mkdir(tmp, parents=True)
+        env = 'APPTAINER_TMPDIR=%s APPTAINER_CACHEDIR=%s ' % (shlex.quote(tmp), shlex.quote(os.path.join(tmp, 'c')))
+        if 'sif' in self.cfg['formats']:
+            sif = os.path.join(self.builddir, 'image.sif')
+            run_shell_cmd(env + 'apptainer build --force %s oci:%s' % (shlex.quote(sif), shlex.quote(layout)))
+        if 'sqsh' in self.cfg['formats']:
+            self._build_sqsh(env, layout)
+
+    def _build_sqsh(self, env, layout):
+        """Rootfs via an Apptainer sandbox, minus Apptainer's files, plus enroot's /etc files, squashed."""
+        rootfs = os.path.join(self.builddir, 'rootfs')
+        run_shell_cmd(env + 'apptainer build --force --sandbox %s oci:%s' % (shlex.quote(rootfs), shlex.quote(layout)))
+        for rel in APPTAINER_PATHS:
+            path = os.path.join(rootfs, rel)
+            if os.path.islink(path) or os.path.isfile(path):
+                os.remove(path)
+            elif os.path.isdir(path):
+                remove_dir(path)
+        with open(blob_path(self.blobs_dir, self.manifest['config']['digest']), 'rb') as fh:
+            config = json.loads(fh.read().decode())
+        provenance = 'containerstack://%s@%s' % (self.cfg['image'], self.digest)
+        for rel, text in enroot_files(config, provenance).items():
+            write_file(os.path.join(rootfs, rel), text)
+        workdir = (config.get('config') or {}).get('WorkingDir') or '/'
+        mkdir(os.path.join(rootfs, workdir.lstrip('/')), parents=True)
+        sqsh = os.path.join(self.builddir, 'image.sqsh')
+        run_shell_cmd('mksquashfs %s %s -noappend -all-root -no-progress %s'
+                      % (shlex.quote(rootfs), shlex.quote(sqsh), det_squash_options(self.cfg['squash_options'])))
+        adjust_permissions(rootfs, stat.S_IWUSR, add=True, recursive=True)
+        remove_dir(rootfs)
+
+    def install_step(self):
+        """Copy the images, write the wrappers and etc/site.env (manifest.json comes after the smoke tests)."""
+        bindir = os.path.join(self.installdir, 'bin')
+        mkdir(bindir, parents=True)
+        for fmt in self.cfg['formats']:
+            copy_file(os.path.join(self.builddir, 'image.' + fmt), os.path.join(self.installdir, 'image.' + fmt))
+        site_env = ''.join('%s=%s\n' % item for item in sorted(self.cfg['site_env'].items()))
+        write_file(os.path.join(self.installdir, 'etc', 'site.env'), site_env)
+        launchers = dict(self.cfg['launchers'], **{'.cs-run': ''})
+        for name, command in sorted(launchers.items()):
+            path = os.path.join(bindir, name)
+            write_file(path, render_wrapper(self.name, self.version, self.digest, command,
+                                            self.cfg['launch_policy'], self.cfg['binds']))
+            adjust_permissions(path, stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH, add=True)
+
+    def _smoke_cmd(self, fmt, command):
+        """Shell command running one smoke test in one format through bin/.cs-run."""
+        runner = shlex.quote(os.path.join(self.installdir, 'bin', '.cs-run'))
+        if fmt == 'sif':
+            prefix = 'CS_RUNTIME=apptainer'
+        else:
+            prefix = 'CS_RUNTIME=enroot ENROOT_DATA_PATH=%s' % shlex.quote(os.path.join(self.builddir, 'enroot-data'))
+        return '%s %s sh -c %s' % (prefix, runner, shlex.quote(command))
+
+    def run_smoke_tests(self):
+        """Run every smoke test in every format; returns the results, raises on the first failure."""
+        tests = [tuple(test) for test in self.cfg['smoke_tests']]
+        require_gpu = self.cfg['require_gpu_tests']
+        if require_gpu is None:
+            require_gpu = any(kind == 'gpu' for kind, _ in tests)
+        gpu = os.path.exists(os.environ.get('CS_GPU_DEVICE', '/dev/nvidia0'))
+        if require_gpu and not gpu:
+            command = [cmd for kind, cmd in tests if kind == 'gpu'][0]
+            raise EasyBuildError("ContainerStack: GPU smoke test %r cannot run: no GPU on %s; build on a GPU node "
+                                 "or set require_gpu_tests = False", command, socket.gethostname())
+        results = []
+        for fmt in self.cfg['formats']:
+            for kind, command in tests:
+                result = {'format': fmt, 'kind': kind, 'command': command,
+                          'date': time.strftime('%Y-%m-%dT%H:%M:%S')}
+                if kind == 'gpu' and not gpu:
+                    result['result'] = 'not-run: no GPU'
+                else:
+                    start = time.time()
+                    res = run_shell_cmd(self._smoke_cmd(fmt, command), fail_on_error=False)
+                    if res.exit_code != 0:
+                        raise EasyBuildError("ContainerStack: %s smoke test failed in %s (exit %s): %s\n%s",
+                                             kind, fmt, res.exit_code, command, (res.output or '')[-2000:])
+                    result.update(result='pass', seconds=round(time.time() - start, 1))
+                results.append(result)
+            if fmt == 'sqsh':
+                data = shlex.quote(os.path.join(self.builddir, 'enroot-data'))
+                run_shell_cmd('ENROOT_DATA_PATH=%s enroot remove -f $(ENROOT_DATA_PATH=%s enroot list) || true'
+                              % (data, data), fail_on_error=False)
+        return results
+
+    def runtime_versions(self):
+        """Versions of the tools that produced the images."""
+        versions = {}
+        for key, cmd in (('apptainer', 'apptainer --version'), ('enroot', 'enroot version'),
+                         ('mksquashfs', 'mksquashfs -version')):
+            res = run_shell_cmd(cmd, fail_on_error=False, hidden=True)
+            out = (res.output or '').strip()
+            versions[key] = out.splitlines()[0] if res.exit_code == 0 and out else 'unavailable'
+        return versions
+
+    def write_manifest(self, path, results):
+        """Write manifest.json: what was installed, from which blobs, with which tools, and the smoke results."""
+        files = {}
+        for fmt in self.cfg['formats']:
+            image = os.path.join(self.installdir, 'image.' + fmt)
+            files['image.' + fmt] = {'size': os.path.getsize(image), 'sha256': file_sha256(image)}
+        data = {
+            'name': self.name, 'version': self.version, 'image': self.cfg['image'],
+            'registry': self.registry, 'repository': self.repo, 'arch': self.arch_key, 'digest': self.digest,
+            'config_digest': self.manifest['config']['digest'],
+            'layers': [layer['digest'] for layer in self.manifest['layers']],
+            'files': files, 'runtimes': self.runtime_versions(), 'smoke_tests': results,
+            'easybuild': str(EASYBUILD_VERSION), 'easyblocks': str(EASYBLOCKS_VERSION),
+        }
+        write_file(path, json.dumps(data, indent=2, sort_keys=True) + '\n')
+
+    def check_existing_manifest(self, path):
+        """For --module-only / --sanity-check-only: the install must be complete and match the pinned digest."""
+        if not os.path.isfile(path):
+            raise EasyBuildError("ContainerStack: %s has no manifest.json: not a complete install (rebuild it)",
+                                 self.installdir)
+        data = json.loads(read_file(path))
+        if data.get('digest') != self.digest:
+            raise EasyBuildError("ContainerStack: %s was built from %s but the recipe pins %s",
+                                 self.installdir, data.get('digest'), self.digest)
+        return data
+
+    def sanity_check_step(self, *args, **kwargs):
+        """Check files, run the smoke tests, then (and only then) write manifest.json."""
+        if self.digest is None:
+            self._validate()
+        files = ['image.%s' % fmt for fmt in self.cfg['formats']] + ['bin/.cs-run', 'etc/site.env']
+        files += [os.path.join('bin', name) for name in sorted(self.cfg['launchers'])]
+        super().sanity_check_step(custom_paths={'files': files, 'dirs': []})
+        manifest_path = os.path.join(self.installdir, MANIFEST)
+        if build_option('module_only') or self.cfg['module_only'] or build_option('sanity_check_only'):
+            self.check_existing_manifest(manifest_path)
+            if build_option('sanity_check_only'):
+                self.run_smoke_tests()
+            return
+        results = self.run_smoke_tests()
+        self.write_manifest(manifest_path, results)
+
+    def permissions_step(self):
+        """Standard permissions, then make the installed files read-only (directories stay writable)."""
+        super().permissions_step()
+        adjust_permissions(self.installdir, stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH, add=False, onlyfiles=True,
+                           recursive=True)
+
+    def make_module_extra(self, *args, **kwargs):
+        """Module variables <PREFIX>_SQSH, <PREFIX>_SIF and <PREFIX>_DIGEST (bin/ is on PATH by default)."""
+        if self.digest is None:
+            self._validate()
+        txt = super().make_module_extra(*args, **kwargs)
+        prefix = env_var_prefix(self.name)
+        for fmt in self.cfg['formats']:
+            txt += self.module_generator.set_environment('%s_%s' % (prefix, fmt.upper()),
+                                                         os.path.join(self.installdir, 'image.' + fmt))
+        txt += self.module_generator.set_environment(prefix + '_DIGEST', self.digest)
+        return txt
