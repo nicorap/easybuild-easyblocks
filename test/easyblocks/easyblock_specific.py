@@ -933,13 +933,13 @@ class EasyBlockSpecificTest(TestCase):
         """select_digest() returns the host-arch digest and explains every way a recipe can get it wrong."""
         good = 'sha256:' + 'a' * 64
         self.assertEqual(containerstack.select_digest({'x86_64': good}, 'x86_64'), good)
-        self.assertErrorRegex(EasyBuildError, "no digest for host architecture aarch64; recipe supports: x86_64",
-                              containerstack.select_digest, {'x86_64': good}, 'aarch64')
-        self.assertErrorRegex(EasyBuildError, "recipe supports: none", containerstack.select_digest, {}, 'x86_64')
-        self.assertErrorRegex(EasyBuildError, "not of the form sha256:<64 hex>",
-                              containerstack.select_digest, {'x86_64': 'sha256:abc'}, 'x86_64')
-        self.assertErrorRegex(EasyBuildError, "not of the form sha256:<64 hex>",
-                              containerstack.select_digest, {'x86_64': '26.10-py3'}, 'x86_64')
+        self.assertRaisesRegex(EasyBuildError, "no digest for host architecture aarch64; recipe supports: x86_64",
+                               containerstack.select_digest, {'x86_64': good}, 'aarch64')
+        self.assertRaisesRegex(EasyBuildError, "recipe supports: none", containerstack.select_digest, {}, 'x86_64')
+        self.assertRaisesRegex(EasyBuildError, "not of the form sha256:<64 hex>",
+                               containerstack.select_digest, {'x86_64': 'sha256:abc'}, 'x86_64')
+        self.assertRaisesRegex(EasyBuildError, "not of the form sha256:<64 hex>",
+                               containerstack.select_digest, {'x86_64': '26.10-py3'}, 'x86_64')
 
     def test_containerstack_host_arch_key(self):
         """EasyBuild's architecture names map to the recipe's digest keys; others are refused."""
@@ -949,7 +949,7 @@ class EasyBlockSpecificTest(TestCase):
                 containerstack.get_cpu_architecture = lambda arch=arch: arch
                 self.assertEqual(containerstack.host_arch_key(), key)
             containerstack.get_cpu_architecture = lambda: 'POWER'
-            self.assertErrorRegex(EasyBuildError, "unsupported host architecture POWER", containerstack.host_arch_key)
+            self.assertRaisesRegex(EasyBuildError, "unsupported host architecture POWER", containerstack.host_arch_key)
         finally:
             containerstack.get_cpu_architecture = orig
 
@@ -963,7 +963,7 @@ class EasyBlockSpecificTest(TestCase):
         self.assertEqual(split('127.0.0.1:5000/team/tiny'), ('127.0.0.1:5000', 'team/tiny'))
         self.assertEqual(split('localhost/tiny'), ('localhost', 'tiny'))
         for bad in ('nvcr.io/nvidia/pytorch:26.10-py3', 'python@sha256:' + 'a' * 64):
-            self.assertErrorRegex(EasyBuildError, "must not contain a tag or digest", split, bad)
+            self.assertRaisesRegex(EasyBuildError, "must not contain a tag or digest", split, bad)
         self.assertEqual(containerstack.env_var_prefix('PyTorch-container'), 'PYTORCHCONTAINER')
         self.assertEqual(containerstack.env_var_prefix('vLLM-container'), 'VLLMCONTAINER')
 
