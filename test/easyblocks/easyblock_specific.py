@@ -1311,6 +1311,72 @@ class EasyBlockSpecificTest(TestCase):
         os.environ['ENROOT_SQUASH_OPTIONS'] = '-comp gzip'
         self.assertEqual(containerstack.det_squash_options(), '-comp gzip')
 
+    def test_containerstack_wrapper(self):
+        """Wrappers choose the runtime from context and pass arguments, mounts and site env through unchanged."""
+        root = os.path.join(self.tmpdir, 'install')
+        fakebin = os.path.join(self.tmpdir, 'fakebin')
+        for tool in ('srun', 'apptainer', 'enroot'):
+            path = os.path.join(fakebin, tool)
+            write_file(path, '#!/bin/bash\necho "TOOL $(basename "$0")"\nfor a in "$@"; do echo "ARG $a"; done\n'
+                             'echo "ENV OMP_NUM_THREADS=$OMP_NUM_THREADS"\n')
+            adjust_permissions(path, stat.S_IXUSR, add=True)
+        for fmt in ('sqsh', 'sif'):
+            write_file(os.path.join(root, 'image.' + fmt), '')
+        write_file(os.path.join(root, 'etc', 'site.env'), 'OMP_NUM_THREADS=1\n')
+        wrapper = os.path.join(root, 'bin', 'greet')
+        write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64,
+                                                          "cat '/etc/my greeting'", 'auto', ['/data', '/x:/y']))
+        adjust_permissions(wrapper, stat.S_IXUSR, add=True)
+        real = os.path.realpath(root)          # the wrapper resolves symlinks (macOS /var -> /private/var)
+        sif, sqsh = os.path.join(real, 'image.sif'), os.path.join(real, 'image.sqsh')
+
+        def run(env=None, args=()):
+            full = {'PATH': fakebin + ':/usr/bin:/bin', 'CS_GPU_DEVICE': os.path.join(self.tmpdir, 'no-gpu')}
+            full.update(env or {})
+            res = subprocess.run([wrapper] + list(args), env=full, capture_output=True, text=True)
+            return res.returncode, res.stdout.splitlines(), res.stderr
+
+        # outside Slurm: Apptainer, binds normalised to src:dst, command words and user args intact, site env set
+        code, out, _ = run(args=['a b', "it's"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out, ['TOOL apptainer', 'ARG exec', 'ARG --bind', 'ARG /data:/data,/x:/y', 'ARG ' + sif,
+                               'ARG cat', 'ARG /etc/my greeting', 'ARG a b', "ARG it's", 'ENV OMP_NUM_THREADS=1'])
+        # in an allocation but not in a step (batch script): pyxis via srun
+        code, out, _ = run({'SLURM_JOB_ID': '42'})
+        self.assertEqual(out, ['TOOL srun', 'ARG --container-image=' + sqsh, 'ARG --container-mounts=/data:/data,/x:/y',
+                               'ARG --container-env=OMP_NUM_THREADS', 'ARG cat', 'ARG /etc/my greeting',
+                               'ENV OMP_NUM_THREADS=1'])
+        code, out, _ = run({'SLURM_JOB_ID': '42', 'CS_SRUN_ARGS': '--ntasks-per-node=1 -N 2'})
+        self.assertEqual(out[1:4], ['ARG --ntasks-per-node=1', 'ARG -N', 'ARG 2'])
+        # already inside a step: pyxis can no longer attach a container -> Apptainer, never a nested srun
+        code, out, _ = run({'SLURM_JOB_ID': '42', 'SLURM_STEP_ID': '0'})
+        self.assertEqual(out[0], 'TOOL apptainer')
+        # a GPU device present -> --nv
+        gpu = os.path.join(self.tmpdir, 'nvidia0')
+        write_file(gpu, '')
+        code, out, _ = run({'CS_GPU_DEVICE': gpu})
+        self.assertEqual(out[:3], ['TOOL apptainer', 'ARG exec', 'ARG --nv'])
+        # forced enroot (sqsh): create once, start with mounts and env names
+        code, out, _ = run({'CS_RUNTIME': 'sqsh'})
+        self.assertEqual(code, 0)
+        self.assertEqual(out[:2], ['TOOL enroot', 'ARG start'])
+        self.assertEqual(out[out.index('ARG --env') + 1], 'ARG OMP_NUM_THREADS')
+        self.assertIn('ARG /x:/y', out)
+        self.assertIn('ARG cs-tiny-1.0-aaaaaaaaaaaa', out)
+        # debug output, and an unknown runtime
+        _, _, err = run({'CS_DEBUG': '1'})
+        self.assertIn('ContainerStack: runtime=apptainer', err)
+        code, _, err = run({'CS_RUNTIME': 'bogus'})
+        self.assertEqual(code, 2)
+        self.assertIn("unknown CS_RUNTIME 'bogus'", err)
+        # the generic .cs-run wrapper runs its arguments
+        cs_run = os.path.join(root, 'bin', '.cs-run')
+        write_file(cs_run, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64, '', 'auto', []))
+        adjust_permissions(cs_run, stat.S_IXUSR, add=True)
+        res = subprocess.run([cs_run, 'sh', '-c', 'true'], capture_output=True, text=True,
+                             env={'PATH': fakebin + ':/usr/bin:/bin', 'CS_GPU_DEVICE': '/nonexistent'})
+        self.assertEqual(res.stdout.splitlines()[:5], ['TOOL apptainer', 'ARG exec', 'ARG ' + sif, 'ARG sh', 'ARG -c'])
+
 
 def suite(loader):
     """Return all easyblock-specific tests."""
