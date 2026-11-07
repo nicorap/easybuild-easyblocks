@@ -2843,27 +2843,31 @@ class EasyBlockSpecificTest(TestCase):
                 self.assertEqual('shadow' in txt, warns, (syntax, launchers, txt))
 
     def test_containerstack_module_warning_quoting(self):
-        """The load warning prints the module name verbatim in Tcl and Lua, whatever characters it has."""
+        """The load warning prints the module name verbatim in Tcl and Lua, whatever characters it has: unbalanced
+        braces, control characters (also before a digit) as escapes, never raw in the module file."""
         eb, _ = self._cs_easyblock(extra="launchers = {'python': 'python'}\n")
-        name = 'odd[x] $y "q" \\z {b} ]==] [exit 3];/1.0'
-        warning = ("WARNING: %s: the container's python now shadows the host Python (EBROOTPYTHON is set); host "
-                   "Python packages are not visible inside the container; set CS_PYTHONPATH to pass paths into the "
-                   "container\n" % name)
+        names = ('odd[x] $y "q" \\z {b} ]==] [exit 3];\x01' + '7\x1b\r\t/1.0', 'x{/1.0', '}y/1.0')
         stubs = {'Tcl': ('tclsh', 'proc module-info {what mode} { return 1 }\n'),
                  'Lua': ('lua', 'function mode() return "load" end\n')}
-        ran = []
-        for syntax, generator in (('Lua', ModuleGeneratorLua), ('Tcl', ModuleGeneratorTcl)):
-            eb.module_generator = generator(eb, fake=True)
-            with mock.patch.object(containerstack.ContainerStack, 'short_mod_name', new=name):
-                code = eb._host_python_warning()
-            self.assertIn('shadows', code)
-            interpreter, stub = stubs[syntax]
-            if not shutil.which(interpreter):
-                continue
-            res = subprocess.run([shutil.which(interpreter)], input=stub + code, capture_output=True, text=True,
-                                 env={'PATH': os.environ.get('PATH', ''), 'EBROOTPYTHON': '/host/python'})
-            self.assertEqual((res.returncode, res.stdout, res.stderr), (0, '', warning), syntax)
-            ran.append(syntax)
+        ran = set()
+        for name in names:
+            warning = ("WARNING: %s: the container's python now shadows the host Python (EBROOTPYTHON is set); host "
+                       "Python packages are not visible inside the container; set CS_PYTHONPATH to pass paths into "
+                       "the container\n" % name)
+            for syntax, generator in (('Lua', ModuleGeneratorLua), ('Tcl', ModuleGeneratorTcl)):
+                eb.module_generator = generator(eb, fake=True)
+                with mock.patch.object(containerstack.ContainerStack, 'short_mod_name', new=name):
+                    code = eb._host_python_warning()
+                self.assertIn('shadows', code)
+                self.assertEqual([c for c in code if (ord(c) < 32 and c != '\n') or ord(c) == 127], [], syntax)
+                interpreter, stub = stubs[syntax]
+                if not shutil.which(interpreter):
+                    continue
+                # bytes, so that a carriage return is compared as it is (text mode would turn it into a newline)
+                res = subprocess.run([shutil.which(interpreter)], input=(stub + code).encode(), capture_output=True,
+                                     env={'PATH': os.environ.get('PATH', ''), 'EBROOTPYTHON': '/host/python'})
+                self.assertEqual((res.returncode, res.stdout, res.stderr.decode()), (0, b'', warning), (syntax, name))
+                ran.add(syntax)
         if not ran:
             self.skipTest("neither tclsh nor lua to run the module code with")
 
