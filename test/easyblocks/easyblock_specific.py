@@ -217,8 +217,8 @@ class EasyBlockSpecificTest(TestCase):
         self.orig_environ = copy.deepcopy(os.environ)
         self.orig_pythonpackage_run_shell_cmd = pythonpackage.run_shell_cmd
         self.cs_orig = (containerstack.run_shell_cmd, containerstack.source_paths, containerstack.host_arch_key,
-                        containerstack.disk_free, EasyBlock.sanity_check_step)
-        self.cs_orig_opts = {opt: build_option(opt) for opt in ('module_only', 'sanity_check_only')}
+                        containerstack.disk_free, EasyBlock.sanity_check_step, EasyBlock.make_module_step)
+        self.cs_orig_opts = {opt: build_option(opt) for opt in ('module_only', 'sanity_check_only', 'force')}
         self.cs_fail = {}
         self.cs_calls = []
         self.cs_squashed = {}
@@ -230,7 +230,7 @@ class EasyBlockSpecificTest(TestCase):
     def tearDown(self):
         """Test cleanup."""
         (containerstack.run_shell_cmd, containerstack.source_paths, containerstack.host_arch_key,
-         containerstack.disk_free, EasyBlock.sanity_check_step) = self.cs_orig
+         containerstack.disk_free, EasyBlock.sanity_check_step, EasyBlock.make_module_step) = self.cs_orig
         for opt, value in self.cs_orig_opts.items():
             update_build_option(opt, value)
         if os.path.isdir(self.tmpdir):
@@ -1580,6 +1580,19 @@ class EasyBlockSpecificTest(TestCase):
         eb.sanity_check_step()
         self.assertTrue(any('.cs-run' in c for c in self.cs_calls))
         self.assertEqual(json.loads(read_file(manifest_path)), {'digest': img['manifest']})
+
+    def test_containerstack_module_only_force_warns(self):
+        """--module-only --force skips the sanity check, so the manifest check too: the module step says so."""
+        EasyBlock.make_module_step = lambda self, fake=False: 'modpath'
+        eb, _ = self._cs_easyblock()
+        update_build_option('module_only', True)
+        for force, fake, warned in ((True, False, True), (False, False, False), (True, True, False)):
+            update_build_option('force', force)
+            with self.mocked_stdout_stderr() as (stdout, stderr):
+                self.assertEqual(eb.make_module_step(fake=fake), 'modpath')
+            output = stdout.getvalue() + stderr.getvalue()
+            self.assertEqual("--force skips the manifest/digest check; do not promote with --force" in output,
+                             warned, (force, fake, output))
 
     def test_containerstack_rebuild_readonly(self):
         """Installed files become read-only, and --rebuild can still replace the install."""

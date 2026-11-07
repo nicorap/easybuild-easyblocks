@@ -468,7 +468,12 @@ def render_wrapper(name, version, digest, command, policy, binds):
 
 
 class ContainerStack(EasyBlock):
-    """Deploy a digest-pinned OCI image as a module, in enroot/pyxis (.sqsh) and Apptainer (.sif) formats."""
+    """
+    Deploy a digest-pinned OCI image as a module, in enroot/pyxis (.sqsh) and Apptainer (.sif) formats.
+
+    Promotion (`eb --module-only` with hidden = False) must not use --force: EasyBuild then skips the sanity check,
+    and with it the check that the install's manifest.json matches the pinned digest.
+    """
 
     @staticmethod
     def extra_options(extra_vars=None):
@@ -708,6 +713,14 @@ class ContainerStack(EasyBlock):
         super().permissions_step()
         adjust_permissions(self.installdir, stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH, add=False, onlyfiles=True,
                            recursive=True)
+
+    def make_module_step(self, fake=False):
+        """Generate the module file; warn when --module-only --force skipped the manifest/digest check."""
+        module_only = build_option('module_only') or self.cfg['module_only']
+        if not fake and module_only and build_option('force'):
+            print_warning("ContainerStack: --force skips the manifest/digest check; do not promote with --force",
+                          log=self.log)
+        return super().make_module_step(fake=fake)
 
     def make_module_extra(self, *args, **kwargs):
         """Module variables <PREFIX>_SQSH, <PREFIX>_SIF and <PREFIX>_DIGEST (bin/ is on PATH by default)."""
