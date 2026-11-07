@@ -1422,6 +1422,49 @@ class EasyBlockSpecificTest(TestCase):
                              env={'PATH': fakebin + ':/usr/bin:/bin', 'CS_GPU_DEVICE': '/nonexistent'})
         self.assertEqual(res.stdout.splitlines()[:5], ['TOOL apptainer', 'ARG exec', 'ARG ' + sif, 'ARG sh', 'ARG -c'])
 
+    def test_containerstack_apptainer_triton_libcuda(self):
+        """With --nv, Apptainer gets TRITON_LIBCUDA_PATH=/.singularity.d/libs, unless the caller set it already."""
+        root = os.path.join(self.tmpdir, 'install')
+        fakebin = os.path.join(self.tmpdir, 'fakebin')
+        for tool in ('srun', 'apptainer', 'enroot'):
+            path = os.path.join(fakebin, tool)
+            write_file(path, '#!/bin/bash\necho "TOOL $(basename "$0")"\nfor a in "$@"; do echo "ARG $a"; done\n'
+                             'echo "ENV TRITON_LIBCUDA_PATH=${TRITON_LIBCUDA_PATH-unset}"\n'
+                             'echo "ENV APPTAINERENV_TRITON_LIBCUDA_PATH=${APPTAINERENV_TRITON_LIBCUDA_PATH-unset}"\n')
+            adjust_permissions(path, stat.S_IXUSR, add=True)
+        for fmt in ('sqsh', 'sif'):
+            write_file(os.path.join(root, 'image.' + fmt), '')
+        wrapper = os.path.join(root, 'bin', 'python')
+        write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64, 'python', 'auto', []))
+        adjust_permissions(wrapper, stat.S_IXUSR, add=True)
+        gpu = os.path.join(self.tmpdir, 'nvidia0')
+        write_file(gpu, '')
+
+        def run(env):
+            full = {'PATH': fakebin + ':/usr/bin:/bin', 'CS_GPU_DEVICE': gpu}
+            full.update(env)
+            res = subprocess.run([wrapper], env=full, capture_output=True, text=True)
+            self.assertEqual((res.returncode, res.stderr), (0, ''))
+            out = res.stdout.splitlines()
+            return out[0], 'ARG --nv' in out, [line for line in out if line.startswith('ENV ')]
+
+        # Apptainer with --nv: Triton looks for libcuda where --nv put the driver libraries
+        self.assertEqual(run({}), ('TOOL apptainer', True,
+                                   ['ENV TRITON_LIBCUDA_PATH=unset',
+                                    'ENV APPTAINERENV_TRITON_LIBCUDA_PATH=/.singularity.d/libs']))
+        # the caller's own setting (either name, even empty) is left alone
+        self.assertEqual(run({'TRITON_LIBCUDA_PATH': '/opt/drv'})[2], ['ENV TRITON_LIBCUDA_PATH=/opt/drv',
+                                                                       'ENV APPTAINERENV_TRITON_LIBCUDA_PATH=unset'])
+        self.assertEqual(run({'TRITON_LIBCUDA_PATH': ''})[2], ['ENV TRITON_LIBCUDA_PATH=',
+                                                               'ENV APPTAINERENV_TRITON_LIBCUDA_PATH=unset'])
+        self.assertEqual(run({'APPTAINERENV_TRITON_LIBCUDA_PATH': '/opt/drv'})[2],
+                         ['ENV TRITON_LIBCUDA_PATH=unset', 'ENV APPTAINERENV_TRITON_LIBCUDA_PATH=/opt/drv'])
+        # no GPU (no --nv), pyxis and enroot (the NVIDIA hook puts libcuda in the image's library path): not set
+        unset = ['ENV TRITON_LIBCUDA_PATH=unset', 'ENV APPTAINERENV_TRITON_LIBCUDA_PATH=unset']
+        self.assertEqual(run({'CS_GPU_DEVICE': '/nonexistent'}), ('TOOL apptainer', False, unset))
+        self.assertEqual(run({'SLURM_JOB_ID': '42'}), ('TOOL srun', False, unset))
+        self.assertEqual(run({'CS_RUNTIME': 'sqsh'})[::2], ('TOOL enroot', unset))
+
     def test_containerstack_enroot_skips_entrypoint(self):
         """Under enroot the wrappers run their command, not the image's entrypoint (as Apptainer and pyxis' default)."""
         eb, _ = self._cs_easyblock()

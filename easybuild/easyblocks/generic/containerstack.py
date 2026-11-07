@@ -542,6 +542,7 @@ WRAPPER_TEMPLATE = r'''#!/bin/bash
 # run it; pyxis does not by default, but does where the site's plugstack sets execute_entrypoint=1.
 # Under pyxis the wrapper starts ONE task, like the plain command (srun --nodes=1 --ntasks=1, even in a big batch job);
 # CS_SRUN_ARGS comes after these and srun's later options win, e.g. CS_SRUN_ARGS="--nodes=2 --ntasks=2" (one per node).
+# With a GPU, Apptainer gets --nv and, unless (APPTAINERENV_)TRITON_LIBCUDA_PATH is set, Triton's libcuda path.
 root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)" || exit 1
 sqsh="$root/image.sqsh"
 sif="$root/image.sif"
@@ -585,7 +586,14 @@ case "$runtime" in
     apptainer)
         command -v apptainer >/dev/null 2>&1 || { echo "ContainerStack: apptainer not found on PATH" >&2; exit 127; }
         args=()
-        [ -n "$gpu" ] && args+=(--nv)
+        if [ -n "$gpu" ]; then
+            args+=(--nv)
+            # --nv puts the driver libraries in /.singularity.d/libs, which the image's ldconfig cache does not
+            # list, so Triton (torch.compile) cannot find libcuda.so; the caller's own setting wins
+            if [ -z "${TRITON_LIBCUDA_PATH+set}${APPTAINERENV_TRITON_LIBCUDA_PATH+set}" ]; then
+                export APPTAINERENV_TRITON_LIBCUDA_PATH=/.singularity.d/libs
+            fi
+        fi
         [ ${#mounts[@]} -gt 0 ] && args+=(--bind "$(join "${mounts[@]}")")
         exec apptainer exec "${args[@]}" "$sif" "${cmd[@]}" "$@" ;;
     enroot)
@@ -624,6 +632,11 @@ class ContainerStack(EasyBlock):
     Like pyxis' default and `apptainer exec`, the wrappers run the given command, not the image's ENTRYPOINT. Under
     enroot this is done by etc/enroot-no-entrypoint.conf (installed with the .sqsh), an `enroot start --conf` hook
     that writes 'exec "$@"' to the container's /etc/rc.local.
+
+    With a GPU, the Apptainer wrappers add --nv and export APPTAINERENV_TRITON_LIBCUDA_PATH=/.singularity.d/libs
+    (where --nv binds the driver libraries, which the image's ldconfig cache does not list), so that Triton, e.g. for
+    torch.compile, finds libcuda.so; not when the caller has set TRITON_LIBCUDA_PATH or
+    APPTAINERENV_TRITON_LIBCUDA_PATH. pyxis and enroot need nothing: their NVIDIA hook updates the cache.
 
     Promotion (`eb --module-only` with hidden = False) must not use --force: EasyBuild then skips the sanity check,
     and with it the check that the install's manifest.json matches the pinned digest.
