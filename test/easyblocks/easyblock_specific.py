@@ -86,6 +86,10 @@ class _CSFakeRegistry:
         self.token_auth = []
         self.tamper_manifest = False
         self.tamper_blobs = False
+        self.token = 'T0K'
+        self.reject_tokens = False
+        self.redirect_blobs = False
+        self.cdn_auth = []
         registry = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -103,8 +107,13 @@ class _CSFakeRegistry:
                 registry.requests.append(self.path)
                 if self.path.startswith('/token'):
                     registry.token_auth.append(self.headers.get('Authorization'))
-                    return self._send(200, b'{"token": "T0K"}', 'application/json')
-                if self.headers.get('Authorization') != 'Bearer T0K':
+                    return self._send(200, json.dumps({'token': registry.token}).encode(), 'application/json')
+                if self.path.startswith('/cdn/'):
+                    registry.cdn_auth.append(self.headers.get('Authorization'))
+                    if self.headers.get('Authorization'):
+                        return self._send(400, b'{}', 'application/json')
+                    return self._send(200, registry.blobs[self.path[len('/cdn/'):]], 'application/octet-stream')
+                if registry.reject_tokens or self.headers.get('Authorization') != 'Bearer ' + registry.token:
                     challenge = 'Bearer realm="http://127.0.0.1:%d/token",service="fake",scope="repository:%s:pull"'
                     self.send_response(401)
                     self.send_header('WWW-Authenticate', challenge % (registry.port, registry.repo))
@@ -118,6 +127,12 @@ class _CSFakeRegistry:
                 if kind == 'manifests' and ref in registry.manifests:
                     data, ctype = registry.manifests[ref]
                     return self._send(200, data + (b' ' if registry.tamper_manifest else b''), ctype)
+                if kind == 'blobs' and ref in registry.blobs and registry.redirect_blobs:
+                    self.send_response(307)
+                    self.send_header('Location', 'http://127.0.0.1:%d/cdn/%s' % (registry.port, ref))
+                    self.send_header('Content-Length', '0')
+                    self.end_headers()
+                    return None
                 if kind == 'blobs' and ref in registry.blobs:
                     data = registry.blobs[ref] + (b'x' if registry.tamper_blobs else b'')
                     return self._send(200, data, 'application/octet-stream')
@@ -1146,6 +1161,33 @@ class EasyBlockSpecificTest(TestCase):
         _, img, client = self._cs_registry()
         self.assertEqual(client.platform_digests('1.0'), {'x86_64': img['manifest']})
         self.assertRaisesRegex(EasyBuildError, "single-architecture image", client.platform_digests, img['manifest'])
+
+    def test_containerstack_registry_token_refresh(self):
+        """An expired token is dropped and renewed once; a registry that never accepts the token still fails."""
+        reg, img, client = self._cs_registry()
+        client.fetch_manifest(img['manifest'])
+        self.assertEqual(len([r for r in reg.requests if r.startswith('/token')]), 1)
+        reg.token = 'T1K'
+        data, _ = client.fetch_manifest(img['manifest'])
+        self.assertEqual(json.loads(data)['layers'][0]['digest'], img['layer'])
+        self.assertEqual(len([r for r in reg.requests if r.startswith('/token')]), 2)
+        self.assertEqual(client.token, 'T1K')
+        reg.reject_tokens = True
+        self.assertRaisesRegex(EasyBuildError, "returned HTTP 401", client.fetch_manifest, img['manifest'])
+        self.assertEqual(len([r for r in reg.requests if r.startswith('/token')]), 3)
+        fresh = containerstack.RegistryClient(reg.address, reg.repo, scheme='http')
+        self.assertRaisesRegex(EasyBuildError, "returned HTTP 401", fresh.fetch_manifest, img['manifest'])
+        self.assertEqual(len([r for r in reg.requests if r.startswith('/token')]), 4)
+
+    def test_containerstack_registry_blob_redirect(self):
+        """Blobs follow a registry redirect to a CDN, and the bearer token is not sent to the CDN."""
+        reg, img, client = self._cs_registry()
+        reg.redirect_blobs = True
+        dest = os.path.join(self.tmpdir, 'layer.tar.gz')
+        client.fetch_blob(img['layer'], dest)
+        self.assertEqual(containerstack.file_sha256(dest), img['layer'])
+        self.assertFalse(os.path.exists(dest + '.part'))
+        self.assertEqual(reg.cdn_auth, [None])
 
 
 def suite(loader):

@@ -166,16 +166,22 @@ class RegistryClient:
         self.creds = registry_credentials(registry)
 
     def _open(self, url, accept):
-        """GET url, answering one bearer-token challenge; returns the HTTP response."""
+        """GET url, answering one bearer-token challenge (new or expired token); returns the HTTP response.
+
+        The token is sent as an unredirected header, so it never follows a redirect (e.g. a blob to a CDN).
+        """
         for attempt in range(2):
-            headers = {'Accept': accept}
+            req = urllib.request.Request(url, headers={'Accept': accept})
             if self.token:
-                headers['Authorization'] = 'Bearer ' + self.token
+                req.add_unredirected_header('Authorization', 'Bearer ' + self.token)
             try:
-                return urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=self.timeout)
+                return urllib.request.urlopen(req, timeout=self.timeout)
             except urllib.error.HTTPError as err:
-                if err.code == 401 and self.token is None and attempt == 0:
-                    self._authenticate(err.headers.get('WWW-Authenticate', ''))
+                challenge = err.headers.get('WWW-Authenticate', '')
+                err.close()
+                if err.code == 401 and attempt == 0:
+                    self.token = None
+                    self._authenticate(challenge)
                     continue
                 raise EasyBuildError("ContainerStack: %s returned HTTP %s", url, err.code)
             except (urllib.error.URLError, OSError) as err:
@@ -193,9 +199,13 @@ class RegistryClient:
         req = urllib.request.Request(fields['realm'] + '?' + query)
         if self.creds:
             basic = base64.b64encode(('%s:%s' % self.creds).encode()).decode()
-            req.add_header('Authorization', 'Basic ' + basic)
+            req.add_unredirected_header('Authorization', 'Basic ' + basic)
         try:
-            reply = json.loads(urllib.request.urlopen(req, timeout=60).read().decode())
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                reply = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as err:
+            err.close()
+            raise EasyBuildError("ContainerStack: token request to %s failed: %s", fields['realm'], err)
         except (urllib.error.URLError, OSError, ValueError) as err:
             raise EasyBuildError("ContainerStack: token request to %s failed: %s", fields['realm'], err)
         self.token = reply.get('token') or reply.get('access_token')
@@ -204,13 +214,14 @@ class RegistryClient:
 
     def fetch_manifest(self, digest):
         """Fetch a per-architecture manifest by digest; returns (bytes, media_type) after checking its sha256."""
-        resp = self._open('%s/manifests/%s' % (self.base, digest), ACCEPT)
-        data = resp.read()
+        with self._open('%s/manifests/%s' % (self.base, digest), ACCEPT) as resp:
+            data = resp.read()
+            content_type = resp.headers.get('Content-Type', '')
         if sha256_digest(data) != digest:
             raise EasyBuildError("ContainerStack: registry returned a manifest with sha256 %s, not the requested %s",
                                  sha256_digest(data), digest)
         doc = json.loads(data.decode())
-        media_type = doc.get('mediaType') or resp.headers.get('Content-Type', '').split(';')[0].strip()
+        media_type = doc.get('mediaType') or content_type.split(';')[0].strip()
         if media_type in INDEX_TYPES or 'manifests' in doc:
             raise EasyBuildError("ContainerStack: %s is a multi-arch index, not a per-architecture manifest; "
                                  "pin the per-architecture digests (RegistryClient.platform_digests)", digest)
@@ -218,10 +229,9 @@ class RegistryClient:
 
     def fetch_blob(self, digest, dest):
         """Stream blob digest to dest via dest.part, checking its sha256; nothing is left behind on mismatch."""
-        resp = self._open('%s/blobs/%s' % (self.base, digest), '*/*')
         part = dest + '.part'
         sha = hashlib.sha256()
-        with open(part, 'wb') as fh:
+        with self._open('%s/blobs/%s' % (self.base, digest), '*/*') as resp, open(part, 'wb') as fh:
             for chunk in iter(lambda: resp.read(CHUNK), b''):
                 sha.update(chunk)
                 fh.write(chunk)
@@ -233,8 +243,8 @@ class RegistryClient:
 
     def platform_digests(self, ref):
         """Per-architecture manifest digests ({'x86_64': ..., 'aarch64': ...}) of the multi-arch index ref."""
-        resp = self._open('%s/manifests/%s' % (self.base, ref), ACCEPT)
-        data = resp.read()
+        with self._open('%s/manifests/%s' % (self.base, ref), ACCEPT) as resp:
+            data = resp.read()
         doc = json.loads(data.decode())
         if 'manifests' not in doc:
             raise EasyBuildError("ContainerStack: %s is a single-architecture image (digest %s); "
