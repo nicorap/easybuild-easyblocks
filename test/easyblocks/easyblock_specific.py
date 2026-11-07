@@ -76,6 +76,39 @@ from easybuild.tools.toolchain.toolchain import RPATH_WRAPPERS_SUBDIR
 
 CS_OCI_INDEX = 'application/vnd.oci.image.index.v1+json'
 CS_OCI_MANIFEST = 'application/vnd.oci.image.manifest.v1+json'
+# enough of enroot 4.2.0 for the wrappers: 'list', 'create', and 'start' printing the container's environment, made
+# as runtime::_do_environ, common::envfmt and enroot-switchroot make it (with enroot's set -euo pipefail)
+CS_FAKE_ENROOT = r'''#!/bin/bash
+set -euo pipefail
+case "$1" in list | create) exit 0 ;; start) shift ;; *) exit 1 ;; esac
+# enroot's own settings join its environment (enroot.in)
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run}" ENROOT_DATA_PATH="${ENROOT_DATA_PATH:-/data}"
+conf= envs=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --conf) conf="$2"; shift 2 ;;
+        --env) envs+=("$2"); shift 2 ;;
+        --mount) shift 2 ;;
+        *) break ;;
+    esac
+done
+export ENROOT_ENVIRON="@DIR@/environment"
+(
+    [ -z "$conf" ] || source "$conf"
+    # the image's /etc/environment, then the --conf file's environ(), then --env
+    cat "@DIR@/image-environment" > "$ENROOT_ENVIRON"
+    if declare -F environ > /dev/null; then
+        environ >> "$ENROOT_ENVIRON"
+    fi
+    for env in ${envs[@]+"${envs[@]}"}; do
+        awk '{ print /=/ ? $0 : $0"="ENVIRON[$0] }' <<< "$env"
+    done >> "$ENROOT_ENVIRON"
+)
+# envfmt drops ill-formed and ENROOT_ lines; switchroot clears the environment and sets each line (a later one wins)
+sed -e '/^[[:alpha:]_][[:alnum:]_]*=/!d' -e '/^ENROOT_/d' "$ENROOT_ENVIRON" |
+    awk '{ i = index($0, "="); v[substr($0, 1, i - 1)] = substr($0, i + 1) }
+         END { for (k in v) print "ENV " k "=" v[k] }'
+'''
 
 
 class _CSFakeRegistry:
@@ -1499,6 +1532,38 @@ class EasyBlockSpecificTest(TestCase):
         self.assertEqual(start('echo', 'hi'), 'hi\n')
         self.assertEqual(start('pwd', '-P'), os.path.realpath(workdir) + '\n')    # still in the image's WorkingDir
         self.assertEqual(start(), 'ENTRY default\n')
+
+    def test_containerstack_enroot_caller_env(self):
+        """Under enroot the caller's environment reaches the container, as under pyxis and Apptainer."""
+        root, fake = os.path.join(self.tmpdir, 'install'), os.path.join(self.tmpdir, 'fake-enroot')
+        fakebin = os.path.join(self.tmpdir, 'fakebin')
+        write_file(os.path.join(fakebin, 'enroot'), CS_FAKE_ENROOT.replace('@DIR@', fake))
+        adjust_permissions(os.path.join(fakebin, 'enroot'), stat.S_IXUSR, add=True)
+        write_file(os.path.join(fake, 'image-environment'),
+                   'PATH=/image/bin\nSHARED=image\nIMAGE_ONLY=image\nOMP_NUM_THREADS=image\n')
+        write_file(os.path.join(root, 'image.sqsh'), '')
+        write_file(os.path.join(root, 'etc', 'site.env'), 'OMP_NUM_THREADS=1\n')
+        write_file(os.path.join(root, containerstack.ENROOT_NO_ENTRYPOINT), containerstack.ENROOT_NO_ENTRYPOINT_CONF)
+        wrapper = os.path.join(root, 'bin', 'python')
+        write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64, 'python', 'auto', []))
+        adjust_permissions(wrapper, stat.S_IXUSR, add=True)
+        caller = {'PATH': fakebin + ':/usr/bin:/bin', 'CS_RUNTIME': 'sqsh', 'CS_GPU_DEVICE': '/nonexistent',
+                  'HF_HUB_OFFLINE': '1', 'NCCL_DEBUG': 'INFO', 'SPACED': ' a  b ', 'EMPTY': '',
+                  'SHARED': 'caller', 'OMP_NUM_THREADS': '8', 'TWO_LINES': 'a\nINJECTED=1',
+                  'LD_LIBRARY_PATH': '/host/lib', 'LD_PRELOAD': '/host/lib/x.so', 'LANG': 'C.UTF-8', 'LC_ALL': 'C',
+                  'HOME': '/home/u', 'USER': 'u', 'TERM': 'xterm'}
+        res = subprocess.run([wrapper, '-c', 'pass'], env=caller, capture_output=True, text=True)
+        self.assertEqual((res.returncode, res.stderr), (0, ''))
+        env = dict(line[4:].split('=', 1) for line in res.stdout.splitlines())
+        for name in ('PWD', 'SHLVL'):    # bash's own, passed on like any other
+            env.pop(name, None)
+        # the caller's variables go in as they are; the image's ENV wins over them (as under pyxis), site.env over
+        # both; PATH, LD_*, locale and the user's identity are the image's or enroot's, never the caller's; a value
+        # with a newline cannot be one line of enroot's environment file and stays out; enroot's own XDG_* too
+        self.assertEqual(env, {'PATH': '/image/bin', 'IMAGE_ONLY': 'image', 'SHARED': 'image',
+                               'OMP_NUM_THREADS': '1', 'APPTAINERENV_OMP_NUM_THREADS': '1',
+                               'CS_RUNTIME': 'sqsh', 'CS_GPU_DEVICE': '/nonexistent',
+                               'HF_HUB_OFFLINE': '1', 'NCCL_DEBUG': 'INFO', 'SPACED': ' a  b ', 'EMPTY': ''})
 
     def _cs_fake_run(self, cmd, **kwargs):
         """Stand-in for run_shell_cmd: records commands and fakes the files Apptainer/mksquashfs would make."""

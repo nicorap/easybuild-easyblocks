@@ -94,12 +94,33 @@ fi
 ENROOT_RC_LOCAL = ("# This file is sourced by /etc/rc when the container starts.\n"
                    "# It can be used to manipulate the entrypoint or the command of the container.\n")
 ENROOT_DEFAULT_SQUASH_OPTIONS = '-comp lzo -noD -exit-on-error'
-# 'enroot start --conf' file for the wrappers, so that enroot runs the command and not the image's entrypoint, like
+# 'enroot start --conf' file for the wrappers. hooks(): enroot runs the command and not the image's entrypoint, like
 # Apptainer's exec and pyxis' default (the same hook): /etc/rc sources /etc/rc.local before it
-# execs the entrypoint; with no command, 'exec' is a no-op and /etc/rc goes on as usual
+# execs the entrypoint; with no command, 'exec' is a no-op and /etc/rc goes on as usual.
+# environ(): the caller's environment (the names the wrapper lists in CS_CALLER_ENV) goes in, as pyxis and Apptainer
+# pass it on. As under pyxis: what the image's /etc/environment or enroot's environ.d already set (in $ENROOT_ENVIRON
+# by now) keeps its value, the --env names (etc/site.env) come after and win, and PATH, LD_LIBRARY_PATH, LD_PRELOAD
+# (pyxis never passes those to enroot), LANG, LANGUAGE, LC_ALL (pyxis takes the container's) and HOME, SHELL, USER,
+# LOGNAME, TERM (enroot sets them for the container's user) are never the caller's. A value with a newline is skipped:
+# enroot's environment file has one variable per line.
 ENROOT_NO_ENTRYPOINT = os.path.join('etc', 'enroot-no-entrypoint.conf')
-ENROOT_NO_ENTRYPOINT_CONF = '''hooks() {
+ENROOT_NO_ENTRYPOINT_CONF = r'''hooks() {
     echo 'exec "$@"' > "${ENROOT_ROOTFS}/etc/rc.local"
+}
+
+environ() {
+    local name IFS=$' \t\n'
+    for name in ${CS_CALLER_ENV-}; do
+        case "${name}" in
+            _ | CS_CALLER_ENV | PATH | LD_LIBRARY_PATH | LD_PRELOAD | LANG | LANGUAGE | LC_ALL | \
+            HOME | SHELL | USER | LOGNAME | TERM) continue ;;
+        esac
+        [ -n "${!name+set}" ] || continue
+        [[ "${!name}" != *$'\n'* ]] || continue
+        grep -q "^[[:space:]]*${name}=" "${ENROOT_ENVIRON}" && continue
+        printf '%s=%s\n' "${name}" "${!name}"
+    done
+    return 0
 }
 '''
 
@@ -543,6 +564,8 @@ WRAPPER_TEMPLATE = r'''#!/bin/bash
 # Under pyxis the wrapper starts ONE task, like the plain command (srun --nodes=1 --ntasks=1, even in a big batch job);
 # CS_SRUN_ARGS comes after these and srun's later options win, e.g. CS_SRUN_ARGS="--nodes=2 --ntasks=2" (one per node).
 # With a GPU, Apptainer gets --nv and, unless (APPTAINERENV_)TRITON_LIBCUDA_PATH is set, Triton's libcuda path.
+# The caller's environment goes in under every runtime (enroot: environ() in etc/enroot-no-entrypoint.conf); image ENV
+# beats it, etc/site.env beats both; enroot never takes the caller's PATH, LD_*, locale, HOME, USER, SHELL, TERM.
 root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)" || exit 1
 sqsh="$root/image.sqsh"
 sif="$root/image.sif"
@@ -603,6 +626,8 @@ case "$runtime" in
         [ -n "$gpu" ] && args+=(--env NVIDIA_VISIBLE_DEVICES=all)
         for m in "${mounts[@]}"; do args+=(--mount "$m"); done
         for n in "${names[@]}"; do args+=(--env "$n"); done
+        # the caller's environment, through the --conf file's environ() (image ENV and site.env win, as under pyxis)
+        export CS_CALLER_ENV="$(compgen -e)"
         exec enroot start "${args[@]}" "$cname" "${cmd[@]}" "$@" ;;
     *)
         echo "ContainerStack: unknown CS_RUNTIME '$runtime' (use auto, apptainer, enroot, pyxis, sif or sqsh)" >&2
@@ -637,6 +662,14 @@ class ContainerStack(EasyBlock):
     (where --nv binds the driver libraries, which the image's ldconfig cache does not list), so that Triton, e.g. for
     torch.compile, finds libcuda.so; not when the caller has set TRITON_LIBCUDA_PATH or
     APPTAINERENV_TRITON_LIBCUDA_PATH. pyxis and enroot need nothing: their NVIDIA hook updates the cache.
+
+    Every runtime passes the caller's environment into the container, with the same precedence: the image's ENV wins
+    over the caller's value, etc/site.env (site_env) over both (pyxis: --container-env; Apptainer: APPTAINERENV_*;
+    enroot: --env). Under enroot, the environ() function of etc/enroot-no-entrypoint.conf adds the caller's variables
+    that the image's /etc/environment and enroot's environ.d do not set, as pyxis does. It never forwards PATH,
+    LD_LIBRARY_PATH, LD_PRELOAD (neither does pyxis), LANG, LANGUAGE, LC_ALL (pyxis uses the container's) or HOME,
+    SHELL, USER, LOGNAME, TERM (enroot sets them for the container's user), nor a value containing a newline (enroot's
+    environment file has one variable per line).
 
     Promotion (`eb --module-only` with hidden = False) must not use --force: EasyBuild then skips the sanity check,
     and with it the check that the install's manifest.json matches the pinned digest.
