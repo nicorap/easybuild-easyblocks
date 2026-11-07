@@ -488,7 +488,8 @@ def fetch_oci_blobs(client, digest, blobs_dir):
                 if verify_blob(target, blob['digest']):
                     continue
                 print_warning("ContainerStack: cached blob %s is corrupt; fetching it again" % blob['digest'])
-                with store_writes(blobs_dir, blob['digest']):
+                # another run without locks may be repairing the same blob, and remove it first
+                with store_writes(blobs_dir, blob['digest']), contextlib.suppress(FileNotFoundError):
                     os.remove(target)
             with store_writes(blobs_dir, blob['digest']):
                 client.fetch_blob(blob['digest'], target, part=download_part(target, locked))

@@ -1595,6 +1595,29 @@ class EasyBlockSpecificTest(TestCase):
         self.assertRaisesRegex(EasyBuildError, "blob %s is missing" % img['layer'],
                                containerstack.verify_oci_blobs, blobs, img['manifest'])
 
+    def test_containerstack_corrupt_blob_removed_meanwhile(self):
+        """A corrupt cached blob that another run (without locks) removes first is just fetched again."""
+        reg, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        layer = containerstack.blob_path(blobs, img['layer'])
+        write_file(layer, 'corrupt')
+        verify, checks = containerstack.verify_blob, []
+
+        def verify_then_lose_it(path, digest):
+            ok = verify(path, digest)
+            checks.append(path)
+            if path == layer and checks.count(layer) == 2:    # the check under the lock: the other run removes it
+                os.remove(layer)
+            return ok
+
+        with mock.patch.object(containerstack, 'verify_blob', side_effect=verify_then_lose_it):
+            with self.mocked_stdout_stderr():
+                containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        self.assertEqual(checks.count(layer), 2)
+        self.assertTrue(reg.blob_requests()[-1].endswith(img['layer']))
+        containerstack.verify_oci_blobs(blobs, img['manifest'])
+
     def test_containerstack_tampered_download_refused(self):
         """A blob whose downloaded bytes do not match its digest is refused and leaves no file behind."""
         reg, img, client = self._cs_registry()
