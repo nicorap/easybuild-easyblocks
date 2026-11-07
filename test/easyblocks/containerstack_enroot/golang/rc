@@ -1,0 +1,14 @@
+# enroot-provenance: docker://registry-1.docker.io#library/golang:sha256:78c9e40f10516d7070156948a1747347cc5093022f06deeff3c9decd5faa3af7
+
+mkdir -p "/go" 2> /dev/null
+cd "/go" && unset OLDPWD || exit 1
+
+if [ -s /etc/rc.local ]; then
+    . /etc/rc.local
+fi
+
+if [ $# -gt 0 ]; then
+    exec  "$@"
+else
+    exec  '/bin/sh'
+fi

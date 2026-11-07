@@ -1,0 +1,15 @@
+# enroot-provenance: docker://registry-1.docker.io#library/nginx:sha256:3bcf852aed06467cf075c6105892e4d5a6ebbbafa0ce22d35062db9e90ddef4c
+# maintainer NGINX Docker Maintainers <docker-maint@nginx.com>
+
+mkdir -p "/" 2> /dev/null
+cd "/" && unset OLDPWD || exit 1
+
+if [ -s /etc/rc.local ]; then
+    . /etc/rc.local
+fi
+
+if [ $# -gt 0 ]; then
+    exec '/docker-entrypoint.sh' "$@"
+else
+    exec '/docker-entrypoint.sh' 'nginx' '-g' 'daemon off;'
+fi

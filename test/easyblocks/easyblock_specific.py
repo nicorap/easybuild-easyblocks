@@ -27,21 +27,35 @@ Unit tests for specific easyblocks.
 
 @author: Kenneth Hoste (Ghent University)
 """
+import base64
 import copy
+import errno
+import fcntl
+import gzip
+import hashlib
+import http.server
+import io
+import json
 import os
 import re
+import shutil
 import stat
+import subprocess
 import sys
+import tarfile
 import tempfile
 import textwrap
+import threading
+import time
 from pathlib import Path
-from unittest import TestLoader, TextTestRunner
+from unittest import TestLoader, TextTestRunner, mock
 from test.easyblocks.module import cleanup
 
 import easybuild.tools.options as eboptions
 import easybuild.tools.tomllib as tomllib
 import easybuild.easyblocks.generic.pythonpackage as pythonpackage
 import easybuild.easyblocks.generic.cargo as cargo
+import easybuild.easyblocks.generic.containerstack as containerstack
 import easybuild.easyblocks.l.lammps as lammps
 import easybuild.easyblocks.p.python as python
 import easybuild.easyblocks.p.pytorch as pytorch
@@ -50,16 +64,216 @@ from easybuild.easyblocks.generic.cmakemake import det_cmake_version
 from easybuild.easyblocks.generic.toolchain import Toolchain
 from easybuild.easyblocks.tensorflow import det_binutils_bin_path
 from easybuild.framework.easyblock import EasyBlock, get_easyblock_instance
+from easybuild.framework.easyconfig import easyconfig
 from easybuild.framework.easyconfig.easyconfig import process_easyconfig
 from easybuild.tools import config
 from easybuild.tools.build_log import EasyBuildError
-from easybuild.tools.config import GENERAL_CLASS, get_module_syntax
+from easybuild.tools.config import GENERAL_CLASS, build_option, get_module_syntax, update_build_option
 from easybuild.tools.environment import modify_env
-from easybuild.tools.filetools import adjust_permissions, mkdir, move_file, remove_dir, symlink, write_file
+from easybuild.tools.filetools import adjust_permissions, mkdir, move_file, read_file, remove_dir, symlink, write_file
+from easybuild.tools.module_generator import ModuleGeneratorLua, ModuleGeneratorTcl
 from easybuild.tools.modules import modules_tool
 from easybuild.tools.options import set_tmpdir
 from easybuild.tools.run import RunShellCmdResult
 from easybuild.tools.toolchain.toolchain import RPATH_WRAPPERS_SUBDIR
+
+
+CS_OCI_INDEX = 'application/vnd.oci.image.index.v1+json'
+CS_OCI_MANIFEST = 'application/vnd.oci.image.manifest.v1+json'
+# enough of enroot 4.2.0 for the wrappers: 'list', 'create', and 'start' printing the container's environment, made
+# as runtime::_do_environ, common::envfmt and enroot-switchroot make it (with enroot's set -euo pipefail)
+CS_FAKE_ENROOT = r'''#!/bin/bash
+set -euo pipefail
+case "$1" in list | create) exit 0 ;; start) shift ;; *) exit 1 ;; esac
+# enroot's own settings join its environment (enroot.in)
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run}" ENROOT_DATA_PATH="${ENROOT_DATA_PATH:-/data}"
+conf= envs=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --conf) conf="$2"; shift 2 ;;
+        --env) envs+=("$2"); shift 2 ;;
+        --mount) shift 2 ;;
+        *) break ;;
+    esac
+done
+export ENROOT_ENVIRON="@DIR@/environment"
+(
+    [ -z "$conf" ] || source "$conf"
+    # the image's /etc/environment, then the --conf file's environ(), then --env
+    cat "@DIR@/image-environment" > "$ENROOT_ENVIRON"
+    if declare -F environ > /dev/null; then
+        environ >> "$ENROOT_ENVIRON"
+    fi
+    for env in ${envs[@]+"${envs[@]}"}; do
+        awk '{ print /=/ ? $0 : $0"="ENVIRON[$0] }' <<< "$env"
+    done >> "$ENROOT_ENVIRON"
+)
+# envfmt drops ill-formed and ENROOT_ lines; switchroot clears the environment and sets each line (a later one wins)
+sed -e '/^[[:alpha:]_][[:alnum:]_]*=/!d' -e '/^ENROOT_/d' "$ENROOT_ENVIRON" |
+    awk '{ i = index($0, "="); v[substr($0, 1, i - 1)] = substr($0, i + 1) }
+         END { for (k in v) print "ENV " k "=" v[k] }'
+'''
+
+
+# the error for a blob a run cannot write into the store: (store, digest)
+CS_STORE_UNWRITABLE = (r"cannot write to blob store %s \(Permission denied\); blob %s is missing or corrupt there; "
+                       "populate it from a run that can write there")
+
+
+class _CSFakeRegistry:
+    """Minimal OCI distribution API on 127.0.0.1 (bearer token, manifests, blobs) for ContainerStack tests."""
+
+    def __init__(self, repo='team/tiny'):
+        self.repo = repo
+        self.manifests = {}
+        self.blobs = {}
+        self.requests = []
+        self.token_auth = []
+        self.tamper_manifest = False
+        self.tamper_blobs = False
+        self.token = 'T0K'
+        self.reject_tokens = False
+        self.redirect_blobs = False
+        self.cdn_auth = []
+        registry = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _send(self, code, body, ctype):
+                self.send_response(code)
+                self.send_header('Content-Type', ctype)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                registry.requests.append(self.path)
+                if self.path.startswith('/token'):
+                    registry.token_auth.append(self.headers.get('Authorization'))
+                    return self._send(200, json.dumps({'token': registry.token}).encode(), 'application/json')
+                if self.path.startswith('/cdn/'):
+                    registry.cdn_auth.append(self.headers.get('Authorization'))
+                    if self.headers.get('Authorization'):
+                        return self._send(400, b'{}', 'application/json')
+                    return self._send(200, registry.blobs[self.path[len('/cdn/'):]], 'application/octet-stream')
+                if registry.reject_tokens or self.headers.get('Authorization') != 'Bearer ' + registry.token:
+                    challenge = 'Bearer realm="http://127.0.0.1:%d/token",service="fake",scope="repository:%s:pull"'
+                    self.send_response(401)
+                    self.send_header('WWW-Authenticate', challenge % (registry.port, registry.repo))
+                    self.send_header('Content-Length', '0')
+                    self.end_headers()
+                    return None
+                prefix = '/v2/%s/' % registry.repo
+                kind, ref = '', ''
+                if self.path.startswith(prefix):
+                    kind, _, ref = self.path[len(prefix):].partition('/')
+                if kind == 'manifests' and ref in registry.manifests:
+                    data, ctype = registry.manifests[ref]
+                    return self._send(200, data + (b' ' if registry.tamper_manifest else b''), ctype)
+                if kind == 'blobs' and ref in registry.blobs and registry.redirect_blobs:
+                    self.send_response(307)
+                    self.send_header('Location', 'http://127.0.0.1:%d/cdn/%s' % (registry.port, ref))
+                    self.send_header('Content-Length', '0')
+                    self.end_headers()
+                    return None
+                if kind == 'blobs' and ref in registry.blobs:
+                    data = registry.blobs[ref] + (b'x' if registry.tamper_blobs else b'')
+                    return self._send(200, data, 'application/octet-stream')
+                return self._send(404, b'{}', 'application/json')
+
+        self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self.port = self.server.server_address[1]
+        self.address = '127.0.0.1:%d' % self.port
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def add_blob(self, data):
+        digest = 'sha256:' + hashlib.sha256(data).hexdigest()
+        self.blobs[digest] = data
+        return digest
+
+    def add_manifest(self, doc, ctype, tag=None):
+        data = json.dumps(doc).encode()
+        digest = 'sha256:' + hashlib.sha256(data).hexdigest()
+        self.manifests[digest] = (data, ctype)
+        if tag:
+            self.manifests[tag] = (data, ctype)
+        return digest
+
+    def blob_requests(self):
+        return [r for r in self.requests if '/blobs/' in r]
+
+
+def _cs_tiny_image(registry, tag='1.0', workdir='/work', user=None, env=()):
+    """
+    Push a one-layer image (file etc/greeting) and a multi-arch index to the fake registry; return digests.
+    env: more config.Env entries ('NAME=value').
+    """
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w:gz') as tar:
+        for name, data in (('etc/greeting', b'hello\n'), ('./etc/hosts', b'127.0.0.1 localhost\n')):
+            info = tarfile.TarInfo(name)
+            info.size, info.mode = len(data), 0o640
+            tar.addfile(info, io.BytesIO(data))
+        info = tarfile.TarInfo('var/empty')
+        info.type, info.mode = tarfile.DIRTYPE, 0o555
+        tar.addfile(info)
+    layer = buf.getvalue()
+    config = {'architecture': 'amd64', 'os': 'linux', 'rootfs': {'type': 'layers', 'diff_ids': []},
+              'config': {'Env': ['PATH=/usr/bin:/bin', 'GREETING=hello world'] + list(env), 'Cmd': ['sh'],
+                         'WorkingDir': workdir}}
+    if user is not None:
+        config['config']['User'] = user
+    config = json.dumps(config).encode()
+    layer_digest = registry.add_blob(layer)
+    config_digest = registry.add_blob(config)
+    manifest = {'schemaVersion': 2, 'mediaType': CS_OCI_MANIFEST,
+                'config': {'mediaType': 'application/vnd.oci.image.config.v1+json', 'digest': config_digest,
+                           'size': len(config)},
+                'layers': [{'mediaType': 'application/vnd.oci.image.layer.v1.tar+gzip', 'digest': layer_digest,
+                            'size': len(layer)}]}
+    manifest_digest = registry.add_manifest(manifest, CS_OCI_MANIFEST)
+    index = {'schemaVersion': 2, 'mediaType': CS_OCI_INDEX, 'manifests': [
+        {'mediaType': CS_OCI_MANIFEST, 'digest': manifest_digest, 'size': len(json.dumps(manifest)),
+         'platform': {'os': 'linux', 'architecture': 'amd64'}},
+        {'mediaType': CS_OCI_MANIFEST, 'digest': 'sha256:' + 'f' * 64, 'size': 1,
+         'platform': {'os': 'unknown', 'architecture': 'unknown'}}]}
+    index_digest = registry.add_manifest(index, CS_OCI_INDEX, tag=tag)
+    return {'manifest': manifest_digest, 'index': index_digest, 'config': config_digest, 'layer': layer_digest}
+
+
+def _cs_member(name, data=b'', kind=tarfile.REGTYPE, mode=0o644, linkname=''):
+    """(TarInfo, data) for a layer member: a file with 'data', or a directory, symlink or whiteout."""
+    info = tarfile.TarInfo(name)
+    info.type, info.mode, info.linkname = kind, mode, linkname
+    if kind == tarfile.REGTYPE:
+        info.size = len(data)
+        return info, io.BytesIO(data)
+    return info, None
+
+
+def _cs_layer(blobs, members, zstd=False):
+    """Write a layer blob (gzip, or zstd via the zstd command) of _cs_member()s to blobs; return its descriptor."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w') as tar:
+        for info, data in members:
+            tar.addfile(info, data)
+    if zstd:
+        blob = subprocess.run(['zstd', '-q', '-c'], input=buf.getvalue(), stdout=subprocess.PIPE, check=True).stdout
+    else:
+        blob = gzip.compress(buf.getvalue(), mtime=0)
+    digest = containerstack.sha256_digest(blob)
+    path = containerstack.blob_path(blobs, digest)
+    mkdir(os.path.dirname(path), parents=True)
+    with open(path, 'wb') as fh:
+        fh.write(blob)
+    return {'mediaType': 'application/vnd.oci.image.layer.v1.tar+%s' % ('zstd' if zstd else 'gzip'),
+            'digest': digest, 'size': len(blob)}
 
 
 class EasyBlockSpecificTest(TestCase):
@@ -84,9 +298,28 @@ class EasyBlockSpecificTest(TestCase):
 
         self.orig_environ = copy.deepcopy(os.environ)
         self.orig_pythonpackage_run_shell_cmd = pythonpackage.run_shell_cmd
+        self.cs_orig = (containerstack.run_shell_cmd, containerstack.source_paths, containerstack.host_arch_key,
+                        containerstack.disk_free, EasyBlock.sanity_check_step, EasyBlock.make_module_step)
+        self.cs_orig_opts = {opt: build_option(opt) for opt in ('module_only', 'sanity_check_only', 'force')}
+        # test.easyblocks.suite runs this after module.py, which leaves --module-only --force set
+        for opt in self.cs_orig_opts:
+            update_build_option(opt, False)
+        self.cs_fail = {}
+        self.cs_calls = []
+        self.cs_squashed = {}
+        os.environ['DOCKER_CONFIG'] = os.path.join(self.tmpdir, 'docker')
+        for var in ('CONTAINERSTACK_REGISTRY_USER', 'CONTAINERSTACK_REGISTRY_PASSWORD', 'CS_GPU_DEVICE',
+                    'ENROOT_SQUASH_OPTIONS', 'ENROOT_SYSCONF_PATH'):
+            os.environ.pop(var, None)
 
     def tearDown(self):
         """Test cleanup."""
+        (containerstack.run_shell_cmd, containerstack.source_paths, containerstack.host_arch_key,
+         containerstack.disk_free, EasyBlock.sanity_check_step, EasyBlock.make_module_step) = self.cs_orig
+        for opt, value in self.cs_orig_opts.items():
+            update_build_option(opt, value)
+        if os.path.isdir(self.tmpdir):
+            adjust_permissions(self.tmpdir, stat.S_IWUSR, add=True, recursive=True)
         remove_dir(self.tmpdir)
 
         pythonpackage.run_shell_cmd = self.orig_pythonpackage_run_shell_cmd
@@ -919,6 +1152,1967 @@ class EasyBlockSpecificTest(TestCase):
                                pytorch.get_test_results, error_log_dir / 'consistency')
         self.assertRaisesRegex(ValueError, "Duplicate test",
                                pytorch.get_test_results, error_log_dir / 'duplicate')
+
+    def test_containerstack_select_digest(self):
+        """select_digest() returns the host-arch digest and explains every way a recipe can get it wrong."""
+        good = 'sha256:' + 'a' * 64
+        self.assertEqual(containerstack.select_digest({'x86_64': good}, 'x86_64'), good)
+        self.assertRaisesRegex(EasyBuildError, "no digest for host architecture aarch64; recipe supports: x86_64",
+                               containerstack.select_digest, {'x86_64': good}, 'aarch64')
+        self.assertRaisesRegex(EasyBuildError, "recipe supports: none", containerstack.select_digest, {}, 'x86_64')
+        self.assertRaisesRegex(EasyBuildError, "not of the form sha256:<64 hex>",
+                               containerstack.select_digest, {'x86_64': 'sha256:abc'}, 'x86_64')
+        self.assertRaisesRegex(EasyBuildError, "not of the form sha256:<64 hex>",
+                               containerstack.select_digest, {'x86_64': '26.10-py3'}, 'x86_64')
+
+    def test_containerstack_host_arch_key(self):
+        """EasyBuild's architecture names map to the recipe's digest keys; others are refused."""
+        orig = containerstack.get_cpu_architecture
+        try:
+            for arch, key in ((containerstack.X86_64, 'x86_64'), (containerstack.AARCH64, 'aarch64')):
+                containerstack.get_cpu_architecture = lambda arch=arch: arch
+                self.assertEqual(containerstack.host_arch_key(), key)
+            containerstack.get_cpu_architecture = lambda: 'POWER'
+            self.assertRaisesRegex(EasyBuildError, "unsupported host architecture POWER", containerstack.host_arch_key)
+        finally:
+            containerstack.get_cpu_architecture = orig
+
+    def test_containerstack_split_image(self):
+        """Image references split into registry and repository; tags and digests are refused."""
+        split = containerstack.split_image
+        self.assertEqual(split('nvcr.io/nvidia/pytorch'), ('nvcr.io', 'nvidia/pytorch'))
+        self.assertEqual(split('python'), ('registry-1.docker.io', 'library/python'))
+        self.assertEqual(split('docker.io/library/python'), ('registry-1.docker.io', 'library/python'))
+        self.assertEqual(split('vllm/vllm-openai'), ('registry-1.docker.io', 'vllm/vllm-openai'))
+        self.assertEqual(split('127.0.0.1:5000/team/tiny'), ('127.0.0.1:5000', 'team/tiny'))
+        self.assertEqual(split('localhost/tiny'), ('localhost', 'tiny'))
+        for bad in ('nvcr.io/nvidia/pytorch:26.10-py3', 'python@sha256:' + 'a' * 64):
+            self.assertRaisesRegex(EasyBuildError, "must not contain a tag or digest", split, bad)
+        self.assertEqual(containerstack.env_var_prefix('PyTorch-container'), 'PYTORCHCONTAINER')
+        self.assertEqual(containerstack.env_var_prefix('vLLM-container'), 'VLLMCONTAINER')
+
+    def _cs_registry(self, workdir='/work', user=None, env=()):
+        """Fake registry with the tiny image, and a client for it."""
+        reg = _CSFakeRegistry()
+        self.addCleanup(reg.close)
+        img = _cs_tiny_image(reg, workdir=workdir, user=user, env=env)
+        return reg, img, containerstack.RegistryClient(reg.address, reg.repo, scheme='http')
+
+    def test_containerstack_registry_token_flow(self):
+        """Anonymous bearer-token flow: 401 challenge, token request, manifest by digest; the token is reused."""
+        reg, img, client = self._cs_registry()
+        data, media_type = client.fetch_manifest(img['manifest'])
+        self.assertEqual(media_type, CS_OCI_MANIFEST)
+        self.assertEqual(json.loads(data)['layers'][0]['digest'], img['layer'])
+        client.fetch_manifest(img['manifest'])
+        self.assertEqual(len([r for r in reg.requests if r.startswith('/token')]), 1)
+        self.assertEqual(reg.token_auth, [None])
+
+    def test_containerstack_registry_rejects_index(self):
+        """Pinning the multi-arch index digest instead of a per-arch manifest digest fails with advice."""
+        _, img, client = self._cs_registry()
+        self.assertRaisesRegex(EasyBuildError, "is a multi-arch index, not a per-architecture manifest",
+                               client.fetch_manifest, img['index'])
+
+    def test_containerstack_registry_rejects_wrong_manifest(self):
+        """A registry that returns different bytes than the requested digest is refused."""
+        reg, img, client = self._cs_registry()
+        reg.tamper_manifest = True
+        self.assertRaisesRegex(EasyBuildError, "not the requested %s" % img['manifest'],
+                               client.fetch_manifest, img['manifest'])
+
+    def test_containerstack_registry_errors(self):
+        """HTTP errors and unreachable registries produce messages naming the URL or host."""
+        _, _, client = self._cs_registry()
+        self.assertRaisesRegex(EasyBuildError, "returned HTTP 404", client.fetch_manifest, 'sha256:' + '0' * 64)
+        dead = containerstack.RegistryClient('127.0.0.1:9', 'x/y', scheme='http', timeout=5)
+        self.assertRaisesRegex(EasyBuildError, "cannot reach", dead.fetch_manifest, 'sha256:' + '0' * 64)
+
+    def test_containerstack_registry_credentials(self):
+        """Credentials come from the environment or $DOCKER_CONFIG/config.json, never from the easyconfig."""
+        reg, img, _ = self._cs_registry()
+        self.assertEqual(containerstack.registry_credentials(reg.address), None)
+        auth = base64.b64encode(b'alice:s3cret').decode()
+        write_file(os.path.join(self.tmpdir, 'docker', 'config.json'),
+                   json.dumps({'auths': {reg.address: {'auth': auth}}}))
+        self.assertEqual(containerstack.registry_credentials(reg.address), ('alice', 's3cret'))
+        os.environ['CONTAINERSTACK_REGISTRY_USER'] = 'bob'
+        os.environ['CONTAINERSTACK_REGISTRY_PASSWORD'] = 'pw'
+        client = containerstack.RegistryClient(reg.address, reg.repo, scheme='http')
+        client.fetch_manifest(img['manifest'])
+        self.assertEqual(reg.token_auth, ['Basic ' + base64.b64encode(b'bob:pw').decode()])
+
+    def test_containerstack_platform_digests(self):
+        """platform_digests() maps a tag's index to per-arch manifest digests (linux only)."""
+        _, img, client = self._cs_registry()
+        self.assertEqual(client.platform_digests('1.0'), {'x86_64': img['manifest']})
+        self.assertRaisesRegex(EasyBuildError, "single-architecture image", client.platform_digests, img['manifest'])
+
+    def test_containerstack_registry_token_refresh(self):
+        """An expired token is dropped and renewed once; a registry that never accepts the token still fails."""
+        reg, img, client = self._cs_registry()
+        client.fetch_manifest(img['manifest'])
+        self.assertEqual(len([r for r in reg.requests if r.startswith('/token')]), 1)
+        reg.token = 'T1K'
+        data, _ = client.fetch_manifest(img['manifest'])
+        self.assertEqual(json.loads(data)['layers'][0]['digest'], img['layer'])
+        self.assertEqual(len([r for r in reg.requests if r.startswith('/token')]), 2)
+        self.assertEqual(client.token, 'T1K')
+        reg.reject_tokens = True
+        self.assertRaisesRegex(EasyBuildError, "returned HTTP 401", client.fetch_manifest, img['manifest'])
+        self.assertEqual(len([r for r in reg.requests if r.startswith('/token')]), 3)
+        fresh = containerstack.RegistryClient(reg.address, reg.repo, scheme='http')
+        self.assertRaisesRegex(EasyBuildError, "returned HTTP 401", fresh.fetch_manifest, img['manifest'])
+        self.assertEqual(len([r for r in reg.requests if r.startswith('/token')]), 4)
+
+    def test_containerstack_registry_blob_redirect(self):
+        """Blobs follow a registry redirect to a CDN, and the bearer token is not sent to the CDN."""
+        reg, img, client = self._cs_registry()
+        reg.redirect_blobs = True
+        dest = os.path.join(self.tmpdir, 'layer.tar.gz')
+        client.fetch_blob(img['layer'], dest)
+        self.assertEqual(containerstack.file_sha256(dest), img['layer'])
+        self.assertFalse(os.path.exists(dest + '.part'))
+        self.assertEqual(reg.cdn_auth, [None])
+
+    def test_containerstack_fetch_and_verify(self):
+        """fetch_oci_blobs() stores manifest, config and layers by digest; verify_oci_blobs() re-checks them."""
+        _, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        manifest = containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        self.assertEqual(manifest['config']['digest'], img['config'])
+        expected = sorted(d.split(':')[1] for d in (img['manifest'], img['config'], img['layer']))
+        self.assertEqual(sorted(os.listdir(blobs)), expected)
+        self.assertEqual(containerstack.verify_oci_blobs(blobs, img['manifest']), manifest)
+
+    def test_containerstack_fetch_reuses_cache(self):
+        """A second fetch of a verified cache makes no registry requests at all."""
+        reg, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        before = len(reg.requests)
+        containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        self.assertEqual(reg.requests[before:], [])
+
+    def test_containerstack_fetch_read_only_cache(self):
+        """A read-only shared store holding a verified cache is used as is: no lock taken, no registry requests."""
+        if os.geteuid() == 0:
+            self.skipTest("root may write to read-only directories")
+        reg, img, client = self._cs_registry()
+        store = os.path.join(self.tmpdir, 'store')
+        blobs = os.path.join(store, 'sha256')
+        containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        remove_dir(blobs + '.locks')    # as in a store filled by the site, read-only for this user
+        for path in (blobs, store):
+            os.chmod(path, 0o555)
+        before = len(reg.requests)
+        with mock.patch.object(containerstack, 'blob_lock', side_effect=AssertionError("blob_lock() used")):
+            with self.mocked_stdout_stderr() as (stdout, stderr):
+                manifest = containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        self.assertEqual(manifest['config']['digest'], img['config'])
+        self.assertEqual(reg.requests[before:], [])
+        self.assertEqual(stdout.getvalue() + stderr.getvalue(), '')
+        self.assertFalse(os.path.exists(blobs + '.locks'))
+
+    def test_containerstack_fetch_read_only_store_missing_blob(self):
+        """A read-only store missing a blob: an error naming blob and store, not a raw PermissionError."""
+        if os.geteuid() == 0:
+            self.skipTest("root may write to read-only directories")
+        _, img, client = self._cs_registry()
+        for missing in ('layer', 'manifest'):
+            store = os.path.join(self.tmpdir, 'store-' + missing)
+            blobs = os.path.join(store, 'sha256')
+            containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+            os.remove(containerstack.blob_path(blobs, img[missing]))
+            remove_dir(blobs + '.locks')    # as in a store filled by the site, read-only for this user
+            for path in (blobs, store):
+                os.chmod(path, 0o555)
+            with self.mocked_stdout_stderr():
+                self.assertRaisesRegex(EasyBuildError, CS_STORE_UNWRITABLE % (re.escape(blobs), img[missing]),
+                                       containerstack.fetch_oci_blobs, client, img['manifest'], blobs)
+            self.assertEqual(len(os.listdir(blobs)), 2)
+
+    def test_containerstack_fetch_read_only_store_corrupt_blob(self):
+        """A corrupt blob in a read-only store: the same error, not a failure to remove it."""
+        if os.geteuid() == 0:
+            self.skipTest("root may write to read-only directories")
+        _, img, client = self._cs_registry()
+        for corrupt in ('layer', 'config', 'manifest'):
+            store = os.path.join(self.tmpdir, 'store-' + corrupt)
+            blobs = os.path.join(store, 'sha256')
+            containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+            path = containerstack.blob_path(blobs, img[corrupt])
+            data = read_file(path, mode='rb')
+            with open(path, 'wb') as fh:
+                fh.write(data[:-1] + bytes([data[-1] ^ 0xff]))
+            remove_dir(blobs + '.locks')    # as in a store filled by the site, read-only for this user
+            for path in (blobs, store):
+                os.chmod(path, 0o555)
+            with self.mocked_stdout_stderr():
+                self.assertRaisesRegex(EasyBuildError, CS_STORE_UNWRITABLE % (re.escape(blobs), img[corrupt]),
+                                       containerstack.fetch_oci_blobs, client, img['manifest'], blobs)
+            self.assertEqual(len(os.listdir(blobs)), 3)
+
+    def test_containerstack_fetch_unwritable_part_file(self):
+        """A .part file this user cannot write (another user's) in a writable store: an error naming store and blob."""
+        if os.geteuid() == 0:
+            self.skipTest("root may open read-only files for writing")
+        _, img, client = self._cs_registry()
+        for missing in ('layer', 'manifest'):
+            blobs = os.path.join(self.tmpdir, 'blobs-' + missing)
+            containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+            path = containerstack.blob_path(blobs, img[missing])
+            os.remove(path)
+            write_file(path + '.part', 'left by another user')
+            os.chmod(path + '.part', 0o444)    # as another user's 0644 file
+            with self.mocked_stdout_stderr():
+                self.assertRaisesRegex(EasyBuildError, CS_STORE_UNWRITABLE % (re.escape(blobs), img[missing]),
+                                       containerstack.fetch_oci_blobs, client, img['manifest'], blobs)
+
+    def test_containerstack_fetch_lockless_part_files(self):
+        """Without locks, blobs and manifest go through new part files of this run's own: removed when interrupted;
+        part files other runs left (whatever their name and content) are never used, renamed or removed."""
+        reg, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        hexes = dict((kind, img[kind].split(':')[1]) for kind in ('manifest', 'config', 'layer'))
+        # what other runs left: an intact copy of the layer, junk, and the names this process' pid once gave
+        foreign = {hexes['layer'] + '.part-otherhost-1': reg.blobs[img['layer']],
+                   hexes['config'] + '.part-otherhost-2': b'junk'}
+        for kind in ('manifest', 'layer'):
+            foreign['%s.part-%s-%d' % (hexes[kind], containerstack.socket.gethostname(), os.getpid())] = b'stale'
+        mkdir(blobs, parents=True)
+        for name, data in foreign.items():
+            with open(os.path.join(blobs, name), 'wb') as fh:
+                fh.write(data)
+        real_open, real_replace = client._open, os.replace
+
+        def open_interrupted(url, accept):
+            """The layer's download stops (Ctrl-C) after its first bytes."""
+            resp = real_open(url, accept)
+            if not url.endswith(img['layer']):
+                return resp
+            first = resp.read(10)
+            resp.close()
+            fake = mock.MagicMock()
+            fake.__enter__.return_value = fake
+            fake.read.side_effect = [first, KeyboardInterrupt()]
+            return fake
+
+        def replace_interrupted(src, dst):
+            """Ctrl-C once the manifest's part file is written."""
+            if os.path.basename(dst) == hexes['manifest']:
+                raise KeyboardInterrupt
+            return real_replace(src, dst)
+
+        def listing():
+            return dict((name, read_file(os.path.join(blobs, name), mode='rb')) for name in os.listdir(blobs))
+
+        nolock = OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+        with mock.patch.object(containerstack.fcntl, 'lockf', side_effect=nolock):
+            with self.mocked_stdout_stderr():
+                with mock.patch.object(containerstack.os, 'replace', side_effect=replace_interrupted):
+                    self.assertRaises(KeyboardInterrupt, containerstack.fetch_oci_blobs, client, img['manifest'],
+                                      blobs)
+                self.assertEqual(listing(), foreign)
+                with mock.patch.object(client, '_open', side_effect=open_interrupted):
+                    self.assertRaises(KeyboardInterrupt, containerstack.fetch_oci_blobs, client, img['manifest'],
+                                      blobs)
+                self.assertEqual(set(listing()), set(foreign) | {hexes['manifest'], hexes['config']})
+                before = len(reg.blob_requests())
+                containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        # the intact foreign copy of the layer was not trusted: downloaded again; the others' files are as they were
+        self.assertEqual([r for r in reg.blob_requests()[before:] if r.endswith(hexes['layer'])],
+                         ['/v2/%s/blobs/%s' % (reg.repo, img['layer'])])
+        containerstack.verify_oci_blobs(blobs, img['manifest'])
+        self.assertEqual(listing(), dict(foreign, **dict((hexes[kind], reg.blobs.get(img[kind]) or
+                                                          reg.manifests[img[kind]][0]) for kind in hexes)))
+        # blobs are as readable as a plain file this user writes (a private 0600 temporary file would not be)
+        for kind in hexes:
+            mode = stat.S_IMODE(os.stat(os.path.join(blobs, hexes[kind])).st_mode)
+            self.assertEqual(mode, 0o666 & ~containerstack.current_umask(), kind)
+
+    def test_containerstack_fetch_unwritable_lock_files(self):
+        """Lock files this user cannot open (another user's): one warning, blobs fetched without the lock."""
+        if os.geteuid() == 0:
+            self.skipTest("root may open read-only files for writing")
+        reg, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        locks = blobs + '.locks'
+        for name in os.listdir(locks):
+            os.chmod(os.path.join(locks, name), 0o444)    # as another user's 0644 lock file
+        for digest in (img['config'], img['layer']):
+            os.remove(containerstack.blob_path(blobs, digest))
+        busy = containerstack.blob_path(blobs, img['layer']) + '.part'
+        write_file(busy, 'another run, also without the lock, is downloading this')
+        with self.mocked_stdout_stderr() as (stdout, stderr):
+            containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        output = stdout.getvalue() + stderr.getvalue()
+        self.assertEqual(output.count("concurrent runs sharing this store are not serialised"), 1, output)
+        self.assertIn("cannot lock %s" % locks, output)
+        containerstack.verify_oci_blobs(blobs, img['manifest'])
+        # without the lock, a download never writes (truncates, renames) the .part another run may be writing
+        self.assertEqual(read_file(busy), 'another run, also without the lock, is downloading this')
+        self.assertEqual(sorted(os.listdir(blobs)), sorted([os.path.basename(busy)] + [
+            d.split(':')[1] for d in (img['manifest'], img['config'], img['layer'])]))
+
+    def test_containerstack_fetch_without_lock_support(self):
+        """A filesystem without POSIX locks (e.g. NFSv3 without lockd): one warning, blobs fetched without locks."""
+        reg, img, client = self._cs_registry()
+        for code in (errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOSYS):
+            blobs = os.path.join(self.tmpdir, 'blobs-%s' % errno.errorcode[code])
+            with mock.patch.object(containerstack.fcntl, 'lockf', side_effect=OSError(code, os.strerror(code))):
+                with self.mocked_stdout_stderr() as (stdout, stderr):
+                    manifest = containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+            output = stdout.getvalue() + stderr.getvalue()
+            self.assertEqual(manifest['config']['digest'], img['config'])
+            self.assertEqual(output.count("concurrent runs sharing this store are not serialised"), 1, output)
+            self.assertIn("cannot lock %s.locks" % blobs, output)
+            containerstack.verify_oci_blobs(blobs, img['manifest'])
+
+    def test_containerstack_fetch_lock_wait_progress(self):
+        """A held blob lock is polled (never a blocking wait), with a progress line naming the lock file."""
+        _, img, client = self._cs_registry()
+        real_lockf = fcntl.lockf
+        for progress, expected in ((60, 0), (0, 3)):
+            blobs = os.path.join(self.tmpdir, 'blobs-%d' % progress)
+            calls = []
+
+            def lockf(fd, flags, *args):
+                calls.append(flags)
+                if len(calls) <= 4:    # the manifest's lock is held for 4 attempts
+                    raise OSError(errno.EAGAIN, os.strerror(errno.EAGAIN))
+                return real_lockf(fd, flags, *args)
+
+            with mock.patch.object(containerstack.fcntl, 'lockf', side_effect=lockf), \
+                    mock.patch.object(containerstack, 'LOCK_POLL_INTERVAL', 0), \
+                    mock.patch.object(containerstack, 'LOCK_PROGRESS_INTERVAL', progress):
+                with self.mocked_stdout_stderr() as (stdout, stderr):
+                    containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+            output = stdout.getvalue() + stderr.getvalue()
+            lock = containerstack.blob_path(blobs + '.locks', img['manifest']) + '.lock'
+            self.assertEqual(output.count("waiting for another EasyBuild run fetching blob %s (lock %s)"
+                                          % (img['manifest'], lock)), 1, output)
+            self.assertEqual(output.count("still waiting"), expected, output)
+            self.assertEqual(output.count("still waiting after"), output.count("lock %s" % lock) - 1, output)
+            self.assertEqual(len(calls), 7)    # 4 + 1 for the manifest, 1 each for config and layer
+            self.assertTrue(all(flags & fcntl.LOCK_NB for flags in calls), calls)
+            containerstack.verify_oci_blobs(blobs, img['manifest'])
+
+    def test_containerstack_fetch_waits_for_concurrent_fetch(self):
+        """A blob another process (eb run) holds the lock of is waited for, then reused, not downloaded again."""
+        reg, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        hexdigest = img['layer'].split(':')[1]
+        lock = os.path.join(self.tmpdir, 'blobs.locks', hexdigest + '.lock')
+        mkdir(os.path.dirname(lock), parents=True)
+        mkdir(blobs, parents=True)
+        source = os.path.join(self.tmpdir, 'layer-bytes')
+        with open(source, 'wb') as fh:
+            fh.write(reg.blobs[img['layer']])
+        ready = os.path.join(self.tmpdir, 'child-has-lock')
+        waiting = os.path.join(self.tmpdir, 'parent-is-waiting')
+        # the other process: holds the blob's POSIX lock until this one says it waits for it (at most 30 s), then
+        # downloads the blob (via its own .part) and releases the lock
+        child_code = textwrap.dedent("""
+            import fcntl, os, shutil, sys, time
+            lock, source, target, ready, waiting = sys.argv[1:]
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o666)
+            fcntl.lockf(fd, fcntl.LOCK_EX)
+            open(ready, 'w').close()
+            deadline = time.time() + 30
+            while not os.path.exists(waiting):
+                if time.time() > deadline:
+                    sys.exit("the other run never said it was waiting for the lock")
+                time.sleep(0.01)
+            shutil.copyfile(source, target + '.part')
+            os.rename(target + '.part', target)
+            os.close(fd)
+        """)
+        orig_print_msg = containerstack.print_msg
+
+        def print_msg(msg, *args, **kwargs):
+            orig_print_msg(msg, *args, **kwargs)
+            if 'waiting for another EasyBuild run' in msg:
+                write_file(waiting, '')
+
+        target = containerstack.blob_path(blobs, img['layer'])
+        with subprocess.Popen([sys.executable, '-c', child_code, lock, source, target, ready, waiting]) as child:
+            for _ in range(600):
+                if os.path.exists(ready) or child.poll() is not None:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(os.path.exists(ready), "child process never took the lock")
+            with mock.patch.object(containerstack, 'print_msg', print_msg), \
+                    mock.patch.object(containerstack, 'LOCK_POLL_INTERVAL', 0.05):
+                with self.mocked_stdout_stderr() as (stdout, stderr):
+                    containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+            self.assertEqual(child.wait(timeout=30), 0)
+        output = stdout.getvalue() + stderr.getvalue()
+        self.assertEqual([r for r in reg.blob_requests() if r.endswith(hexdigest)], [])
+        self.assertEqual(output.count("waiting for another EasyBuild run fetching blob %s" % img['layer']), 1,
+                         output)
+        containerstack.verify_oci_blobs(blobs, img['manifest'])
+        self.assertEqual(sorted(os.listdir(blobs)),
+                         sorted(d.split(':')[1] for d in (img['manifest'], img['config'], img['layer'])))
+
+    def test_containerstack_manifest_written_atomically(self):
+        """The cached manifest is replaced as a new file, never rewritten in place (a reader sees old or new)."""
+        _, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        path = containerstack.blob_path(blobs, img['manifest'])
+        write_file(path, 'stale manifest from an interrupted run')
+        reader = os.path.join(self.tmpdir, 'reader-view')
+        os.link(path, reader)    # what a process that opened the old file sees
+        containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        self.assertEqual(read_file(reader), 'stale manifest from an interrupted run')
+        self.assertTrue(containerstack.verify_blob(path, img['manifest']))
+        self.assertFalse(os.path.exists(path + '.part'))
+
+    def test_containerstack_corrupt_cache_refetched(self):
+        """Corrupt, missing or half-downloaded cached blobs are detected and fetched again, never trusted."""
+        reg, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        layer = containerstack.blob_path(blobs, img['layer'])
+        with open(layer, 'r+b') as fh:
+            fh.seek(10)
+            byte = fh.read(1)
+            fh.seek(10)
+            fh.write(bytes([byte[0] ^ 0xff]))
+        self.assertRaisesRegex(EasyBuildError, "blob %s is corrupt" % img['layer'],
+                               containerstack.verify_oci_blobs, blobs, img['manifest'])
+        write_file(layer + '.part', 'junk from an interrupted download')
+        self.mock_stdout(True)
+        self.mock_stderr(True)
+        containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        self.mock_stdout(False)
+        self.mock_stderr(False)
+        self.assertTrue(reg.blob_requests()[-1].endswith(img['layer']))
+        containerstack.verify_oci_blobs(blobs, img['manifest'])
+        self.assertFalse(os.path.exists(layer + '.part'))
+        os.remove(layer)
+        self.assertRaisesRegex(EasyBuildError, "blob %s is missing" % img['layer'],
+                               containerstack.verify_oci_blobs, blobs, img['manifest'])
+
+    def test_containerstack_corrupt_blob_removed_meanwhile(self):
+        """A corrupt cached blob that another run (without locks) removes first is just fetched again."""
+        reg, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        layer = containerstack.blob_path(blobs, img['layer'])
+        write_file(layer, 'corrupt')
+        verify, checks = containerstack.verify_blob, []
+
+        def verify_then_lose_it(path, digest):
+            ok = verify(path, digest)
+            checks.append(path)
+            if path == layer and checks.count(layer) == 2:    # the check under the lock: the other run removes it
+                os.remove(layer)
+            return ok
+
+        with mock.patch.object(containerstack, 'verify_blob', side_effect=verify_then_lose_it):
+            with self.mocked_stdout_stderr():
+                containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        self.assertEqual(checks.count(layer), 2)
+        self.assertTrue(reg.blob_requests()[-1].endswith(img['layer']))
+        containerstack.verify_oci_blobs(blobs, img['manifest'])
+
+    def test_containerstack_tampered_download_refused(self):
+        """A blob whose downloaded bytes do not match its digest is refused and leaves no file behind."""
+        reg, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        reg.tamper_blobs = True
+        self.assertRaisesRegex(EasyBuildError, "refusing it", containerstack.fetch_oci_blobs, client,
+                               img['manifest'], blobs)
+        self.assertEqual(os.listdir(blobs), [img['manifest'].split(':')[1]])
+
+    def test_containerstack_bad_blob_digest(self):
+        """Digests that are not sha256:<64 hex> are refused before being used as paths in the blob store."""
+        for bad in ('sha256:/etc/x', 'sha256:../../x', 'nocolon', 'sha256:' + 'A' * 64):
+            self.assertRaisesRegex(EasyBuildError, "invalid blob digest", containerstack.blob_path, self.tmpdir, bad)
+        reg, img, client = self._cs_registry()
+        manifest = {'schemaVersion': 2, 'mediaType': CS_OCI_MANIFEST,
+                    'config': {'mediaType': 'application/vnd.oci.image.config.v1+json', 'digest': img['config'],
+                               'size': len(reg.blobs[img['config']])},
+                    'layers': [{'mediaType': 'application/vnd.oci.image.layer.v1.tar+gzip',
+                                'digest': 'sha256:../../escape', 'size': 1}]}
+        digest = reg.add_manifest(manifest, CS_OCI_MANIFEST)
+        blobs = os.path.join(self.tmpdir, 'store', 'blobs')
+        self.assertRaisesRegex(EasyBuildError, "invalid blob digest", containerstack.fetch_oci_blobs, client,
+                               digest, blobs)
+        escaped = [f for _, _, files in os.walk(self.tmpdir) for f in files if f in ('escape', 'escape.part')]
+        self.assertEqual(escaped, [])
+
+    def test_containerstack_oci_layout(self):
+        """write_oci_layout() makes an OCI layout whose blobs are the shared store; rewriting is idempotent."""
+        _, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        layout = os.path.join(self.tmpdir, 'layout')
+        for _ in range(2):
+            containerstack.write_oci_layout(layout, blobs, img['manifest'], CS_OCI_MANIFEST)
+        index = json.loads(read_file(os.path.join(layout, 'index.json')))
+        self.assertEqual(index['manifests'][0]['digest'], img['manifest'])
+        self.assertEqual(index['manifests'][0]['size'],
+                         os.path.getsize(containerstack.blob_path(blobs, img['manifest'])))
+        self.assertTrue(os.path.islink(os.path.join(layout, 'blobs', 'sha256')))
+        self.assertTrue(os.path.isfile(os.path.join(layout, 'blobs', 'sha256', img['layer'].split(':')[1])))
+        self.assertEqual(json.loads(read_file(os.path.join(layout, 'oci-layout'))), {'imageLayoutVersion': '1.0.0'})
+
+    def test_containerstack_enroot_files(self):
+        """enroot_files() reproduces enroot 4.2.0's /etc files exactly (fixtures captured from enroot import)."""
+        topdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'containerstack_enroot')
+        cases = sorted(d for d in os.listdir(topdir) if os.path.isdir(os.path.join(topdir, d)))
+        self.assertEqual(cases, ['golang', 'nginx', 'postgres', 'python'])
+        provenance = re.compile(r'^# enroot-provenance: .*\n')
+        for case in cases:
+            casedir = os.path.join(topdir, case)
+            config = json.loads(read_file(os.path.join(casedir, 'config.json')))
+            files = containerstack.enroot_files(config, 'containerstack://example.org/x@sha256:' + '0' * 64)
+            for rel in ('etc/rc', 'etc/environment', 'etc/fstab', 'etc/rc.local'):
+                expected = read_file(os.path.join(casedir, os.path.basename(rel)))
+                got = files[rel]
+                if rel == 'etc/rc':
+                    self.assertTrue(provenance.match(got), got)
+                    expected, got = provenance.sub('', expected), provenance.sub('', got)
+                self.assertEqual(got, expected, "%s: %s differs from enroot's" % (case, rel))
+        # no entrypoint and no cmd -> /bin/sh; arguments quoted like bash ${var@Q}
+        files = containerstack.enroot_files({'config': {}}, 'p')
+        self.assertIn("    exec  '/bin/sh'\n", files['etc/rc'])
+        files = containerstack.enroot_files({'config': {'Entrypoint': ['/x y', "it's"]}}, 'p')
+        self.assertIn("    exec '/x y' 'it'\\''s' \"$@\"\n", files['etc/rc'])
+        self.assertIn("    exec '/x y' 'it'\\''s' \n", files['etc/rc'])
+
+    def test_containerstack_squash_options(self):
+        """mksquashfs options: easyconfig value, then $ENROOT_SQUASH_OPTIONS, enroot.conf, enroot's default."""
+        self.assertEqual(containerstack.det_squash_options('-comp zstd'), '-comp zstd')
+        os.environ['ENROOT_SYSCONF_PATH'] = os.path.join(self.tmpdir, 'enroot')
+        self.assertEqual(containerstack.det_squash_options(), '-comp lzo -noD -exit-on-error')
+        write_file(os.path.join(self.tmpdir, 'enroot', 'enroot.conf'),
+                   "#ENROOT_SQUASH_OPTIONS -comp lzo\nENROOT_SQUASH_OPTIONS     -noI -noD -noF -no-duplicates  \n")
+        self.assertEqual(containerstack.det_squash_options(), '-noI -noD -noF -no-duplicates')
+        os.environ['ENROOT_SQUASH_OPTIONS'] = '-comp gzip'
+        self.assertEqual(containerstack.det_squash_options(), '-comp gzip')
+
+    def test_containerstack_wrapper(self):
+        """Wrappers choose the runtime from context and pass arguments, mounts and site env through unchanged."""
+        root = os.path.join(self.tmpdir, 'install')
+        fakebin = os.path.join(self.tmpdir, 'fakebin')
+        for tool in ('srun', 'apptainer', 'enroot'):
+            path = os.path.join(fakebin, tool)
+            # like Apptainer, the fake image sets OMP_NUM_THREADS itself: only APPTAINERENV_<NAME> overrides it
+            env = '${APPTAINERENV_OMP_NUM_THREADS:-image}' if tool == 'apptainer' else '$OMP_NUM_THREADS'
+            write_file(path, '#!/bin/bash\necho "TOOL $(basename "$0")"\nfor a in "$@"; do echo "ARG $a"; done\n'
+                             'echo "ENV OMP_NUM_THREADS=%s"\n' % env)
+            adjust_permissions(path, stat.S_IXUSR, add=True)
+        for fmt in ('sqsh', 'sif'):
+            write_file(os.path.join(root, 'image.' + fmt), '')
+        write_file(os.path.join(root, 'etc', 'site.env'), '# site policy\n\nOMP_NUM_THREADS=1\n')
+        # bind sources that exist on this node (missing ones are skipped: test_containerstack_missing_bind_sources)
+        data, x = os.path.join(self.tmpdir, 'data'), os.path.join(self.tmpdir, 'x')
+        mkdir(data, parents=True)
+        mkdir(x, parents=True)
+        wrapper = os.path.join(root, 'bin', 'greet')
+        write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64,
+                                                          "cat '/etc/my greeting'", 'auto', [data, x + ':/y']))
+        adjust_permissions(wrapper, stat.S_IXUSR, add=True)
+        real = os.path.realpath(root)          # the wrapper resolves symlinks (macOS /var -> /private/var)
+        sif, sqsh = os.path.join(real, 'image.sif'), os.path.join(real, 'image.sqsh')
+        mounts = '%s:%s,%s:/y' % (data, data, x)
+
+        def run(env=None, args=()):
+            full = {'PATH': fakebin + ':/usr/bin:/bin', 'CS_GPU_DEVICE': os.path.join(self.tmpdir, 'no-gpu')}
+            full.update(env or {})
+            res = subprocess.run([wrapper] + list(args), env=full, capture_output=True, text=True)
+            return res.returncode, res.stdout.splitlines(), res.stderr
+
+        # outside Slurm: Apptainer, binds normalised to src:dst, command words and user args intact, site env set
+        # (beating the image's own ENV); comment and blank lines in site.env are skipped silently
+        code, out, err = run(args=['a b', "it's"])
+        self.assertEqual(code, 0)
+        self.assertEqual(err, '')
+        self.assertEqual(out, ['TOOL apptainer', 'ARG exec', 'ARG --bind', 'ARG ' + mounts, 'ARG ' + sif,
+                               'ARG cat', 'ARG /etc/my greeting', 'ARG a b', "ARG it's", 'ENV OMP_NUM_THREADS=1'])
+        # in an allocation but not in a step (batch script): pyxis via srun, one task like the plain command
+        code, out, err = run({'SLURM_JOB_ID': '42'})
+        self.assertEqual(err, '')
+        self.assertEqual(out, ['TOOL srun', 'ARG --nodes=1', 'ARG --ntasks=1', 'ARG --container-image=' + sqsh,
+                               'ARG --container-mounts=%s:%s:nofail+silent,%s:/y:nofail+silent' % (data, data, x),
+                               'ARG --container-env=OMP_NUM_THREADS',
+                               'ARG cat', 'ARG /etc/my greeting', 'ENV OMP_NUM_THREADS=1'])
+        # CS_SRUN_ARGS comes after the defaults, so it wins (srun: the later option counts)
+        code, out, _ = run({'SLURM_JOB_ID': '42', 'CS_SRUN_ARGS': '--ntasks-per-node=1 -N 2'})
+        self.assertEqual(out[1:6], ['ARG --nodes=1', 'ARG --ntasks=1', 'ARG --ntasks-per-node=1', 'ARG -N', 'ARG 2'])
+        # already inside a step: pyxis can no longer attach a container -> Apptainer, never a nested srun
+        code, out, _ = run({'SLURM_JOB_ID': '42', 'SLURM_STEP_ID': '0'})
+        self.assertEqual(out[0], 'TOOL apptainer')
+        # a GPU device present -> --nv
+        gpu = os.path.join(self.tmpdir, 'nvidia0')
+        write_file(gpu, '')
+        code, out, _ = run({'CS_GPU_DEVICE': gpu})
+        self.assertEqual(out[:3], ['TOOL apptainer', 'ARG exec', 'ARG --nv'])
+        # forced enroot (sqsh): create once, start with mounts and env names
+        code, out, _ = run({'CS_RUNTIME': 'sqsh'})
+        self.assertEqual(code, 0)
+        self.assertEqual(out[:2], ['TOOL enroot', 'ARG start'])
+        self.assertEqual(out[out.index('ARG --env') + 1], 'ARG OMP_NUM_THREADS')
+        self.assertFalse([a for a in out if '#' in a])
+        self.assertIn('ARG %s:/y' % x, out)
+        self.assertIn('ARG cs-tiny-1.0-aaaaaaaaaaaa', out)
+        # debug output, and an unknown runtime
+        _, _, err = run({'CS_DEBUG': '1'})
+        self.assertIn('ContainerStack: runtime=apptainer', err)
+        code, _, err = run({'CS_RUNTIME': 'bogus'})
+        self.assertEqual(code, 2)
+        self.assertIn("unknown CS_RUNTIME 'bogus'", err)
+        # the generic .cs-run wrapper runs its arguments
+        cs_run = os.path.join(root, 'bin', '.cs-run')
+        write_file(cs_run, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64, '', 'auto', []))
+        adjust_permissions(cs_run, stat.S_IXUSR, add=True)
+        res = subprocess.run([cs_run, 'sh', '-c', 'true'], capture_output=True, text=True,
+                             env={'PATH': fakebin + ':/usr/bin:/bin', 'CS_GPU_DEVICE': '/nonexistent'})
+        self.assertEqual(res.stdout.splitlines()[:5], ['TOOL apptainer', 'ARG exec', 'ARG ' + sif, 'ARG sh', 'ARG -c'])
+
+    def test_containerstack_missing_bind_sources(self):
+        """
+        A bind whose source does not exist here (or is a dangling symlink) is skipped by the wrapper under Apptainer
+        and enroot, which run here, silently unless CS_DEBUG is set (one stderr line each); the others go through as
+        before, options and all. Under pyxis the wrapper checks nothing: srun may run the step on other nodes (salloc
+        from a login node, -N 2), so every bind gets enroot's 'nofail' mount flag (and 'silent' unless CS_DEBUG is
+        set) and each node skips a source it lacks itself.
+        """
+        root, fakebin = os.path.join(self.tmpdir, 'install'), os.path.join(self.tmpdir, 'fakebin')
+        for tool in ('srun', 'apptainer', 'enroot'):
+            path = os.path.join(fakebin, tool)
+            write_file(path, '#!/bin/bash\necho "TOOL $(basename "$0")"\nfor a in "$@"; do echo "ARG $a"; done\n'
+                             'echo "ENV APPTAINER_BIND=${APPTAINER_BIND-unset}"\n')
+            adjust_permissions(path, stat.S_IXUSR, add=True)
+        for fmt in ('sqsh', 'sif'):
+            write_file(os.path.join(root, 'image.' + fmt), '')
+        real = os.path.realpath(root)
+        sif, sqsh = os.path.join(real, 'image.sif'), os.path.join(real, 'image.sqsh')
+        conf = os.path.join(real, containerstack.ENROOT_NO_ENTRYPOINT)
+        host = os.path.join(self.tmpdir, 'host')
+        data = os.path.join(host, 'shared-data')
+        ref = os.path.join(host, 'ref.txt')                          # a file
+        odd = os.path.join(host, 'x$(touch${IFS}pwned);`touch${IFS}pwned`')     # shell in a name is never run
+        glob = os.path.join(host, 'shared-dat?')                     # missing, but its glob matches data
+        mkdir(data, parents=True)
+        mkdir(odd, parents=True)
+        write_file(ref, '')
+        dangling = os.path.join(host, 'dangling')                    # a symlink to nothing counts as missing
+        os.symlink(os.path.join(host, 'gone'), dangling)
+        missing = os.path.join(host, 'missing')
+        missing_odd = os.path.join(host, 'm$(touch${IFS}pwned)x')
+        binds = [missing, data, dangling + ':/dangling', ref + ':/ref.txt:ro', missing + ':/m:ro', odd + ':/odd',
+                 missing_odd, glob + ':/glob']
+        skipped = ['%s:%s' % (missing, missing), dangling + ':/dangling', missing + ':/m:ro',
+                   '%s:%s' % (missing_odd, missing_odd), glob + ':/glob']
+        kept = ['%s:%s' % (data, data), ref + ':/ref.txt:ro', odd + ':/odd']
+        normalised = [skipped[0], kept[0], skipped[1], kept[1], skipped[2], kept[2], skipped[3], skipped[4]]
+        # the precondition: the sources the test skips are missing here, the ones it keeps exist
+        self.assertEqual([os.path.exists(b.split(':')[0]) for b in binds],
+                         [False, True, False, True, False, True, False, False])
+        self.assertTrue(os.path.islink(dangling))
+
+        def wrapper(name, binds):
+            path = os.path.join(root, 'bin', name)
+            write_file(path, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64, 'true', 'auto', binds))
+            adjust_permissions(path, stat.S_IXUSR, add=True)
+            return path
+
+        def run(path, env):
+            full = {'PATH': fakebin + ':/usr/bin:/bin', 'CS_GPU_DEVICE': '/nonexistent'}
+            full.update(env)
+            res = subprocess.run([path], env=full, cwd=host, capture_output=True, text=True, timeout=60)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            return res.stdout.splitlines(), res.stderr
+
+        runtimes = {'apptainer': {}, 'pyxis': {'SLURM_JOB_ID': '42'}, 'enroot': {'CS_RUNTIME': 'sqsh'}}
+        cname = 'ARG cs-tiny-1.0-aaaaaaaaaaaa'
+
+        def expected(runtime, mounts, bind_env='unset'):
+            if runtime == 'apptainer':
+                args = ['ARG exec'] + (['ARG --bind', 'ARG ' + ','.join(mounts)] if mounts else []) + ['ARG ' + sif]
+            elif runtime == 'pyxis':
+                args = ['ARG --nodes=1', 'ARG --ntasks=1', 'ARG --container-image=' + sqsh]
+                args += ['ARG --container-mounts=' + ','.join(mounts)] if mounts else []
+            else:
+                args = ['ARG start', 'ARG --conf', 'ARG ' + conf]
+                for mount in mounts:
+                    # enroot: an fstab line, options after type and bind flags (test_containerstack_bind_options)
+                    src, dst, *opts = mount.split(':')
+                    mount = ':'.join([src, dst] + ['none:x-create=auto,rbind,' + opt for opt in opts])
+                    args += ['ARG --mount', 'ARG ' + mount]
+                args.append(cname)
+            tool = {'pyxis': 'srun'}.get(runtime, runtime)
+            return ['TOOL ' + tool] + args + ['ARG true', 'ENV APPTAINER_BIND=' + bind_env]
+
+        pyxis_debug = ('ContainerStack: binds not checked here: under pyxis each node skips one whose source it lacks '
+                       '(mount flag nofail), with no message\n')
+
+        def pyxis_mounts(normalised, flags):
+            # pyxis: '+' joins mount flags; nofail after the bind's own option, if any
+            return [m + ('+' if m.count(':') == 2 else ':') + flags for m in normalised]
+
+        some = wrapper('some', binds)
+        for runtime, env in runtimes.items():
+            # only the binds whose source exists, in order, options kept; nothing on stderr. pyxis: all of them, each
+            # with nofail+silent
+            mounts = pyxis_mounts(normalised, 'nofail+silent')
+            mounts = mounts if runtime == 'pyxis' else kept
+            self.assertEqual(run(some, env), (expected(runtime, mounts), ''), runtime)
+            # CS_DEBUG: one line per skipped bind; pyxis: none, 'silent' dropped (enroot-mount on the node warns)
+            mounts = pyxis_mounts(normalised, 'nofail')
+            mounts = mounts if runtime == 'pyxis' else kept
+            out, err = run(some, dict(env, CS_DEBUG='1'))
+            self.assertEqual(out, expected(runtime, mounts), runtime)
+            # pyxis: one line saying so (pyxis shows enroot's output only when the container fails to start)
+            self.assertEqual(err, 'ContainerStack: runtime=%s\n' % runtime +
+                             ''.join('ContainerStack: bind %s skipped: %s does not exist on this node\n'
+                                     % (bind, bind.split(':')[0]) for bind in skipped if runtime != 'pyxis') +
+                             (pyxis_debug if runtime == 'pyxis' else ''), runtime)
+        # none exists: no empty --bind/--mount (pyxis: all, nofail), and the user's own APPTAINER_BIND still applies
+        none = wrapper('none', [missing, dangling + ':/dangling', missing_odd + ':/m:ro'])
+        for runtime, env in runtimes.items():
+            mounts = ['%s:%s:nofail+silent' % (missing, missing), dangling + ':/dangling:nofail+silent',
+                      missing_odd + ':/m:ro+nofail+silent'] if runtime == 'pyxis' else []
+            self.assertEqual(run(none, env), (expected(runtime, mounts), ''), runtime)
+            self.assertEqual(run(none, dict(env, APPTAINER_BIND='/scratch:/scratch')),
+                             (expected(runtime, mounts, '/scratch:/scratch'), ''), runtime)
+        # pyxis without binds: no --container-mounts, and no line about them with CS_DEBUG
+        nobinds = wrapper('nobinds', [])
+        self.assertEqual(run(nobinds, runtimes['pyxis']), (expected('pyxis', []), ''))
+        self.assertEqual(run(nobinds, dict(runtimes['pyxis'], CS_DEBUG='1')),
+                         (expected('pyxis', []), 'ContainerStack: runtime=pyxis\n'))
+        self.assertEqual(run(some, {'APPTAINER_BIND': '/scratch'}), (expected('apptainer', kept, '/scratch'), ''))
+        # no shell in a bind ran, in the check or the message
+        self.assertEqual(sorted(os.listdir(host)), sorted(os.path.basename(p) for p in (data, ref, odd, dangling)))
+
+    def test_containerstack_bind_options(self):
+        """
+        A bind's options are 'ro' or 'rw', checked when the wrappers are written, and each runtime gets them in its own
+        form: Apptainer src:dst:ro, pyxis src:dst:ro+nofail..., enroot an fstab line that is still a bind.
+        """
+        root, fakebin = os.path.join(self.tmpdir, 'install'), os.path.join(self.tmpdir, 'fakebin')
+        for tool in ('srun', 'apptainer', 'enroot'):
+            path = os.path.join(fakebin, tool)
+            write_file(path, '#!/bin/bash\nfor a in "$@"; do echo "$a"; done\n')
+            adjust_permissions(path, stat.S_IXUSR, add=True)
+        for fmt in ('sqsh', 'sif'):
+            write_file(os.path.join(root, 'image.' + fmt), '')
+        src_a, src_b, src_c = (os.path.join(self.tmpdir, 'host', n) for n in 'abc')
+        for path in (src_a, src_b, src_c):
+            mkdir(path, parents=True)
+        digest = 'sha256:' + 'a' * 64
+        wrapper = os.path.join(root, 'bin', 'opts')
+        write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', digest, 'true', 'auto',
+                                                          [src_a + ':/a:ro', src_b + ':/b:rw', src_c]))
+        adjust_permissions(wrapper, stat.S_IXUSR, add=True)
+
+        def args(env):
+            full = {'PATH': fakebin + ':/usr/bin:/bin', 'CS_GPU_DEVICE': '/nonexistent'}
+            full.update(env)
+            res = subprocess.run([wrapper], env=full, capture_output=True, text=True, timeout=60)
+            self.assertEqual((res.returncode, res.stderr), (0, ''))
+            return res.stdout.splitlines()
+
+        out = args({})
+        self.assertEqual(out[out.index('--bind') + 1], '%s:/a:ro,%s:/b:rw,%s:%s' % (src_a, src_b, src_c, src_c))
+        out = args({'SLURM_JOB_ID': '42'})
+        self.assertIn('--container-mounts=%s:/a:ro+nofail+silent,%s:/b:rw+nofail+silent,%s:%s:nofail+silent'
+                      % (src_a, src_b, src_c, src_c), out)
+        out = args({'CS_RUNTIME': 'sqsh'})
+        mounts = [out[i + 1] for i, arg in enumerate(out) if arg == '--mount']
+        self.assertEqual(mounts, [src_a + ':/a:none:x-create=auto,rbind,ro', src_b + ':/b:none:x-create=auto,rbind,rw',
+                                  '%s:%s' % (src_c, src_c)])
+        # enroot 4.2.0 (runtime::_do_mounts_fini) turns each into an fstab line with tr ':' ' '; enroot-mount binds
+        # (type none, rbind) and creates the target; src:dst alone gets its default 'none rbind,x-create=auto'
+        for mount, opt in zip(mounts, ('ro', 'rw')):
+            fsname, fsdir, fstype, fsopts = mount.replace(':', ' ').split()
+            self.assertEqual((fstype, fsopts.split(',')), ('none', ['x-create=auto', 'rbind', opt]))
+        # anything else fails when the wrappers are written, naming the bind
+        for bad in ('rbind', 'nosuid', 'RO', 'nofail', 'ro+nofail', 'x-create=dir', ''):
+            bind = src_a + ':/a:' + bad
+            self.assertRaisesRegex(EasyBuildError, "bind %s: options must be 'ro' or 'rw', not '%s'"
+                                   % (re.escape(repr(bind)), re.escape(bad)),
+                                   containerstack.render_wrapper, 'tiny', '1.0', digest, 'true', 'auto', [bind])
+        # and before anything is fetched
+        eb, _ = self._cs_easyblock("binds = ['/data:/data:nosuid']\n")
+        self.assertRaisesRegex(EasyBuildError, "bind '/data:/data:nosuid': options must be 'ro' or 'rw'", eb.fetch_step)
+
+    def test_containerstack_bind_validation(self):
+        """
+        A bind must be 'path', 'src:dst' or 'src:dst:ro|rw' with absolute paths and no ',' or whitespace (the runtimes
+        split a bind list on ',', enroot an fstab line on whitespace): anything else fails when the easyconfig is
+        checked and when the wrappers are written, naming the bind.
+        """
+        digest = 'sha256:' + 'a' * 64
+        relative = 'has a src or dst that is not an absolute path'
+        cases = [('', 'is empty'), ('/a,/b', "contains ',' or whitespace"), ('/a b', "contains ',' or whitespace"),
+                 ('/a:/b\t', "contains ',' or whitespace"), ('/a\n', "contains ',' or whitespace"),
+                 ('/a:/b:ro:x', "has more than 3 ':'-separated fields"), ('/a:/b:ro:', "has more than 3"),
+                 ('data', relative), ('./data:/data', relative), ('/data:data', relative), ('/data:', relative),
+                 (':/data', relative), ('/a::ro', relative), ('~/data', relative)]
+        for bind, msg in cases:
+            regex = "ContainerStack: bind %s %s" % (re.escape(repr(bind)), msg)
+            self.assertRaisesRegex(EasyBuildError, regex, containerstack.render_wrapper, 'tiny', '1.0', digest,
+                                   'true', 'auto', ['/ok', bind])
+            eb, _ = self._cs_easyblock("binds = ['/ok', %r]\n" % bind)
+            self.assertRaisesRegex(EasyBuildError, regex, eb.fetch_step)
+        for bind in (None, 5, ('/a', '/b')):
+            regex = "ContainerStack: bind %s is empty or not a string" % re.escape(repr(bind))
+            self.assertRaisesRegex(EasyBuildError, regex, containerstack.bind_mounts, ['/ok', bind])
+        # the valid forms still pass
+        self.assertEqual(containerstack.bind_mounts(['/a', '/a:/b', '/a:/b:ro', '/a/x$y;z:/b/w:rw']),
+                         ['/a:/a', '/a:/b', '/a:/b:ro', '/a/x$y;z:/b/w:rw'])
+
+    def test_containerstack_wrapper_nounset(self):
+        """
+        The wrappers run under bash -u (set -o nounset, e.g. sourced into a strict script's habits or run as bash -u):
+        no unset variable or empty array is expanded (bash 3.2, macOS's /bin/bash, counts an empty array as unset),
+        under sif, sqsh and pyxis, with no binds left, no GPU, no command words, no arguments, with and without
+        site.env.
+        """
+        root, fakebin = os.path.join(self.tmpdir, 'install'), os.path.join(self.tmpdir, 'fakebin')
+        for tool in ('srun', 'apptainer', 'enroot'):
+            path = os.path.join(fakebin, tool)
+            write_file(path, '#!/bin/bash\necho "TOOL $(basename "$0") $#"\n')
+            adjust_permissions(path, stat.S_IXUSR, add=True)
+        for fmt in ('sqsh', 'sif'):
+            write_file(os.path.join(root, 'image.' + fmt), '')
+        missing = os.path.join(self.tmpdir, 'missing')
+        digest = 'sha256:' + 'a' * 64
+        site_env = os.path.join(root, 'etc', 'site.env')
+        for name, command in (('tool', 'true'), ('.cs-run', '')):
+            # first without site.env (no names), then with one (the first name read meets an empty list)
+            if name == '.cs-run':
+                write_file(site_env, 'OMP_NUM_THREADS=1\n')
+            path = os.path.join(root, 'bin', name)
+            write_file(path, containerstack.render_wrapper('tiny', '1.0', digest, command, 'auto',
+                                                           [missing, missing + ':/m:ro']))
+            adjust_permissions(path, stat.S_IXUSR, add=True)
+            # auto outside Slurm, and with a step id but no job id (auto, as for a stray SLURM_STEP_ID): Apptainer
+            for runtime, env in (('sif', {}), ('sqsh', {}), ('pyxis', {'SLURM_JOB_ID': '42'}), ('auto', {}),
+                                 ('auto', {'SLURM_STEP_ID': '0'})):
+                for debug in ({}, {'CS_DEBUG': '1'}):
+                    full = {'PATH': fakebin + ':/usr/bin:/bin', 'CS_RUNTIME': runtime}
+                    full.update(env, **debug)
+                    res = subprocess.run(['bash', '-u', path], env=full, capture_output=True, text=True, timeout=60)
+                    self.assertEqual(res.returncode, 0, (name, runtime, debug, res.stderr))
+                    self.assertNotIn('unbound variable', res.stderr)
+                    tool = {'sif': 'apptainer', 'sqsh': 'enroot', 'pyxis': 'srun', 'auto': 'apptainer'}[runtime]
+                    self.assertEqual(res.stdout.splitlines()[-1].split()[:2], ['TOOL', tool], (name, runtime))
+
+    def test_containerstack_pyxis_inside_step(self):
+        """CS_RUNTIME=pyxis inside a job step fails at once: a nested srun would wait for this step's resources."""
+        root, fakebin = os.path.join(self.tmpdir, 'install'), os.path.join(self.tmpdir, 'fakebin')
+        called = os.path.join(self.tmpdir, 'srun-called')
+        # a nested srun in a step that holds the allocation waits ('Requested nodes are busy') until the job ends
+        write_file(os.path.join(fakebin, 'srun'), '#!/bin/bash\ntouch "%s"\nsleep 30\n' % called)
+        write_file(os.path.join(fakebin, 'apptainer'), '#!/bin/bash\necho apptainer\n')
+        for tool in ('srun', 'apptainer'):
+            adjust_permissions(os.path.join(fakebin, tool), stat.S_IXUSR, add=True)
+        for fmt in ('sqsh', 'sif'):
+            write_file(os.path.join(root, 'image.' + fmt), '')
+        wrapper = os.path.join(root, 'bin', 'python')
+        write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64, 'python', 'auto', []))
+        adjust_permissions(wrapper, stat.S_IXUSR, add=True)
+
+        def run(env):
+            env = dict(env, PATH=fakebin + ':/usr/bin:/bin', CS_GPU_DEVICE='/nonexistent')
+            start = time.monotonic()
+            res = subprocess.run([wrapper, '-c', 'pass'], env=env, capture_output=True, text=True, timeout=60)
+            return res.returncode, res.stdout, res.stderr, time.monotonic() - start
+
+        code, out, err, seconds = run({'SLURM_JOB_ID': '42', 'SLURM_STEP_ID': '3', 'CS_RUNTIME': 'pyxis'})
+        self.assertEqual((code, out), (1, ''))
+        self.assertEqual(err, "ContainerStack: CS_RUNTIME=pyxis, but already inside job step 3 of job 42; a nested "
+                              "srun would wait for resources held by this step: use CS_RUNTIME=sif or sqsh here, call "
+                              "the launcher from the batch script, or add --overlap to CS_SRUN_ARGS (or set "
+                              "SLURM_OVERLAP) to share this step's resources (GPU requests may still wait on some "
+                              "Slurm versions)\n")
+        self.assertFalse(os.path.exists(called))
+        self.assertLess(seconds, 5)
+        # auto inside a step is unchanged (Apptainer); pyxis outside a step (batch script) still runs srun
+        self.assertEqual(run({'SLURM_JOB_ID': '42', 'SLURM_STEP_ID': '3'})[:2], (0, 'apptainer\n'))
+        self.assertFalse(os.path.exists(called))
+        write_file(os.path.join(fakebin, 'srun'), '#!/bin/bash\necho srun\n')
+        self.assertEqual(run({'SLURM_JOB_ID': '42', 'CS_RUNTIME': 'pyxis'})[:3], (0, 'srun\n', ''))
+
+    def test_containerstack_pyxis_overlap_in_step(self):
+        """Inside a job step, CS_RUNTIME=pyxis runs srun when it overlaps the step (--overlap in CS_SRUN_ARGS, or
+        SLURM_OVERLAP set); auto still avoids pyxis there."""
+        root, fakebin = os.path.join(self.tmpdir, 'install'), os.path.join(self.tmpdir, 'fakebin')
+        write_file(os.path.join(fakebin, 'srun'), '#!/bin/bash\necho "srun $*"\n')
+        write_file(os.path.join(fakebin, 'apptainer'), '#!/bin/bash\necho apptainer\n')
+        for tool in ('srun', 'apptainer'):
+            adjust_permissions(os.path.join(fakebin, tool), stat.S_IXUSR, add=True)
+        for fmt in ('sqsh', 'sif'):
+            write_file(os.path.join(root, 'image.' + fmt), '')
+        wrapper = os.path.join(root, 'bin', 'python')
+        write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64, 'python', 'auto', []))
+        adjust_permissions(wrapper, stat.S_IXUSR, add=True)
+        sqsh = os.path.join(os.path.realpath(root), 'image.sqsh')
+
+        def run(env):
+            env = dict(env, PATH=fakebin + ':/usr/bin:/bin', CS_GPU_DEVICE='/nonexistent', SLURM_JOB_ID='42',
+                       SLURM_STEP_ID='3')
+            res = subprocess.run([wrapper], env=env, capture_output=True, text=True, timeout=60)
+            return res.returncode, res.stdout
+
+        # anywhere in CS_SRUN_ARGS, which srun gets word-split on spaces, tabs and newlines alike
+        for args in ('--overlap', '--gpus=1 --overlap', '--overlap=force', ' -N 1  --overlap ', '-N 1\n--overlap',
+                     '--gpus=1\n\n\t--overlap=force\n'):
+            self.assertEqual(run({'CS_RUNTIME': 'pyxis', 'CS_SRUN_ARGS': args}),
+                             (0, 'srun --nodes=1 --ntasks=1 %s --container-image=%s python\n'
+                                 % (' '.join(args.split()), sqsh)), args)
+        for value in ('1', ''):
+            self.assertEqual(run({'CS_RUNTIME': 'pyxis', 'SLURM_OVERLAP': value}),
+                             (0, 'srun --nodes=1 --ntasks=1 --container-image=%s python\n' % sqsh), value)
+        # only the whole option counts
+        for args in ('--overlapping', '--no-overlap', 'x--overlap', '--overlap,', '-overlap'):
+            self.assertEqual(run({'CS_RUNTIME': 'pyxis', 'CS_SRUN_ARGS': args}), (1, ''), args)
+        # auto inside a step never picks pyxis, overlap or not
+        self.assertEqual(run({'CS_SRUN_ARGS': '--overlap'}), (0, 'apptainer\n'))
+        self.assertEqual(run({'SLURM_OVERLAP': '1'}), (0, 'apptainer\n'))
+
+    def test_containerstack_special_step_ids(self):
+        """The batch, extern and interactive steps (by name or Slurm's special ids) are not job steps: pyxis works."""
+        root, fakebin = os.path.join(self.tmpdir, 'install'), os.path.join(self.tmpdir, 'fakebin')
+        for tool in ('srun', 'apptainer'):
+            write_file(os.path.join(fakebin, tool), '#!/bin/bash\necho %s\n' % tool)
+            adjust_permissions(os.path.join(fakebin, tool), stat.S_IXUSR, add=True)
+        for fmt in ('sqsh', 'sif'):
+            write_file(os.path.join(root, 'image.' + fmt), '')
+        wrapper = os.path.join(root, 'bin', 'python')
+        write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64, 'python', 'auto', []))
+        adjust_permissions(wrapper, stat.S_IXUSR, add=True)
+
+        def run(env):
+            env = dict(env, PATH=fakebin + ':/usr/bin:/bin', CS_GPU_DEVICE='/nonexistent', SLURM_JOB_ID='42')
+            res = subprocess.run([wrapper], env=env, capture_output=True, text=True, timeout=60)
+            return res.returncode, res.stdout
+
+        # names, current ids (interactive 0xfffffffa, batch 0xfffffffb, extern 0xfffffffc) and the older ones
+        # (batch 0xfffffffe, extern 0xffffffff); SLURM_STEPID is the older name of SLURM_STEP_ID
+        special = ('interactive', 'batch', 'extern', '4294967290', '4294967291', '4294967292', '4294967294',
+                   '4294967295')
+        for step in special:
+            for var in ('SLURM_STEP_ID', 'SLURM_STEPID'):
+                self.assertEqual(run({var: step}), (0, 'srun\n'), (var, step))
+                self.assertEqual(run({var: step, 'CS_RUNTIME': 'pyxis'}), (0, 'srun\n'), (var, step))
+        # a real step, by either name: auto avoids pyxis, forced pyxis refuses
+        for var in ('SLURM_STEP_ID', 'SLURM_STEPID'):
+            for step in ('0', '7', '4294967289'):
+                self.assertEqual(run({var: step}), (0, 'apptainer\n'), (var, step))
+                self.assertEqual(run({var: step, 'CS_RUNTIME': 'pyxis'})[0], 1, (var, step))
+        # SLURM_STEP_ID is the one that counts when both are set, unless it is empty (as if unset)
+        self.assertEqual(run({'SLURM_STEP_ID': 'batch', 'SLURM_STEPID': '0'}), (0, 'srun\n'))
+        self.assertEqual(run({'SLURM_STEP_ID': '', 'SLURM_STEPID': '0'}), (0, 'apptainer\n'))
+        self.assertEqual(run({'SLURM_STEP_ID': '', 'SLURM_STEPID': '0', 'CS_RUNTIME': 'pyxis'})[0], 1)
+        self.assertEqual(run({'SLURM_STEP_ID': '', 'SLURM_STEPID': 'batch'}), (0, 'srun\n'))
+        self.assertEqual(run({'SLURM_STEP_ID': ''}), (0, 'srun\n'))
+
+    def test_containerstack_apptainer_triton_libcuda(self):
+        """With --nv, Apptainer gets TRITON_LIBCUDA_PATH=/.singularity.d/libs, unless the caller set it already."""
+        root = os.path.join(self.tmpdir, 'install')
+        fakebin = os.path.join(self.tmpdir, 'fakebin')
+        for tool in ('srun', 'apptainer', 'enroot'):
+            path = os.path.join(fakebin, tool)
+            write_file(path, '#!/bin/bash\necho "TOOL $(basename "$0")"\nfor a in "$@"; do echo "ARG $a"; done\n'
+                             'echo "ENV TRITON_LIBCUDA_PATH=${TRITON_LIBCUDA_PATH-unset}"\n'
+                             'echo "ENV APPTAINERENV_TRITON_LIBCUDA_PATH=${APPTAINERENV_TRITON_LIBCUDA_PATH-unset}"\n')
+            adjust_permissions(path, stat.S_IXUSR, add=True)
+        for fmt in ('sqsh', 'sif'):
+            write_file(os.path.join(root, 'image.' + fmt), '')
+        wrapper = os.path.join(root, 'bin', 'python')
+        write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64, 'python', 'auto', []))
+        adjust_permissions(wrapper, stat.S_IXUSR, add=True)
+        gpu = os.path.join(self.tmpdir, 'nvidia0')
+        write_file(gpu, '')
+
+        def run(env):
+            full = {'PATH': fakebin + ':/usr/bin:/bin', 'CS_GPU_DEVICE': gpu}
+            full.update(env)
+            res = subprocess.run([wrapper], env=full, capture_output=True, text=True)
+            self.assertEqual((res.returncode, res.stderr), (0, ''))
+            out = res.stdout.splitlines()
+            return out[0], 'ARG --nv' in out, [line for line in out if line.startswith('ENV ')]
+
+        # Apptainer with --nv: Triton looks for libcuda where --nv put the driver libraries
+        self.assertEqual(run({}), ('TOOL apptainer', True,
+                                   ['ENV TRITON_LIBCUDA_PATH=unset',
+                                    'ENV APPTAINERENV_TRITON_LIBCUDA_PATH=/.singularity.d/libs']))
+        # the caller's own setting (either name, even empty) is left alone
+        self.assertEqual(run({'TRITON_LIBCUDA_PATH': '/opt/drv'})[2], ['ENV TRITON_LIBCUDA_PATH=/opt/drv',
+                                                                       'ENV APPTAINERENV_TRITON_LIBCUDA_PATH=unset'])
+        self.assertEqual(run({'TRITON_LIBCUDA_PATH': ''})[2], ['ENV TRITON_LIBCUDA_PATH=',
+                                                               'ENV APPTAINERENV_TRITON_LIBCUDA_PATH=unset'])
+        self.assertEqual(run({'APPTAINERENV_TRITON_LIBCUDA_PATH': '/opt/drv'})[2],
+                         ['ENV TRITON_LIBCUDA_PATH=unset', 'ENV APPTAINERENV_TRITON_LIBCUDA_PATH=/opt/drv'])
+        # no GPU (no --nv), pyxis and enroot (the NVIDIA hook puts libcuda in the image's library path): not set
+        unset = ['ENV TRITON_LIBCUDA_PATH=unset', 'ENV APPTAINERENV_TRITON_LIBCUDA_PATH=unset']
+        self.assertEqual(run({'CS_GPU_DEVICE': '/nonexistent'}), ('TOOL apptainer', False, unset))
+        self.assertEqual(run({'SLURM_JOB_ID': '42'}), ('TOOL srun', False, unset))
+        self.assertEqual(run({'CS_RUNTIME': 'sqsh'})[::2], ('TOOL enroot', unset))
+
+    def test_containerstack_enroot_skips_entrypoint(self):
+        """Under enroot the wrappers run their command, not the image's entrypoint (as Apptainer and pyxis' default)."""
+        eb, _ = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        conf = os.path.join(eb.installdir, 'etc', 'enroot-no-entrypoint.conf')
+        self.assertTrue(os.path.isfile(conf))
+        # the wrapper passes the hook to 'enroot start'
+        fakebin = os.path.join(self.tmpdir, 'fakebin')
+        write_file(os.path.join(fakebin, 'enroot'), '#!/bin/bash\nfor a in "$@"; do echo "ARG $a"; done\n')
+        adjust_permissions(os.path.join(fakebin, 'enroot'), stat.S_IXUSR, add=True)
+        res = subprocess.run([os.path.join(eb.installdir, 'bin', 'greet')], capture_output=True, text=True,
+                             env={'PATH': fakebin + ':/usr/bin:/bin', 'CS_RUNTIME': 'enroot',
+                                  'CS_GPU_DEVICE': '/nonexistent'})
+        out = res.stdout.splitlines()
+        self.assertEqual(out[:3], ['ARG start', 'ARG --conf', 'ARG ' + os.path.realpath(conf)])
+        # what the hook does to enroot's /etc/rc: the command runs instead of the entrypoint; no command -> as before
+        rootfs, workdir = os.path.join(self.tmpdir, 'rootfs'), os.path.join(self.tmpdir, 'workdir')
+        files = containerstack.enroot_files({'config': {'Entrypoint': ['echo', 'ENTRY'], 'Cmd': ['default'],
+                                                        'WorkingDir': workdir}}, 'p')
+        write_file(os.path.join(rootfs, 'etc', 'rc.local'), files['etc/rc.local'])
+        rc = os.path.join(rootfs, 'etc', 'rc')
+        write_file(rc, files['etc/rc'].replace('/etc/rc.local', os.path.join(rootfs, 'etc', 'rc.local')))
+
+        def start(*args):
+            return subprocess.run(['bash', rc] + list(args), capture_output=True, text=True).stdout
+
+        self.assertEqual(start('echo', 'hi'), 'ENTRY echo hi\n')    # plain enroot: entrypoint + command
+        subprocess.run(['bash', '-c', 'source "$1" && hooks', '-', conf], check=True,
+                       env={'PATH': '/usr/bin:/bin', 'ENROOT_ROOTFS': rootfs})
+        self.assertEqual(start('echo', 'hi'), 'hi\n')
+        self.assertEqual(start('pwd', '-P'), os.path.realpath(workdir) + '\n')    # still in the image's WorkingDir
+        self.assertEqual(start(), 'ENTRY default\n')
+
+    def test_containerstack_enroot_caller_env(self):
+        """Under enroot the caller's environment reaches the container, as under pyxis and Apptainer."""
+        root, fake = os.path.join(self.tmpdir, 'install'), os.path.join(self.tmpdir, 'fake-enroot')
+        fakebin = os.path.join(self.tmpdir, 'fakebin')
+        write_file(os.path.join(fakebin, 'enroot'), CS_FAKE_ENROOT.replace('@DIR@', fake))
+        adjust_permissions(os.path.join(fakebin, 'enroot'), stat.S_IXUSR, add=True)
+        write_file(os.path.join(fake, 'image-environment'),
+                   'PATH=/image/bin\nSHARED=image\nIMAGE_ONLY=image\nOMP_NUM_THREADS=image\n')
+        write_file(os.path.join(root, 'image.sqsh'), '')
+        write_file(os.path.join(root, 'etc', 'site.env'), 'OMP_NUM_THREADS=1\n')
+        write_file(os.path.join(root, containerstack.ENROOT_NO_ENTRYPOINT), containerstack.ENROOT_NO_ENTRYPOINT_CONF)
+        wrapper = os.path.join(root, 'bin', 'python')
+        write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64, 'python', 'auto', []))
+        adjust_permissions(wrapper, stat.S_IXUSR, add=True)
+        caller = {'PATH': fakebin + ':/usr/bin:/bin', 'CS_RUNTIME': 'sqsh', 'CS_GPU_DEVICE': '/nonexistent',
+                  'HF_HUB_OFFLINE': '1', 'NCCL_DEBUG': 'INFO', 'SPACED': ' a  b ', 'EMPTY': '',
+                  'SHARED': 'caller', 'OMP_NUM_THREADS': '8', 'TWO_LINES': 'a\nINJECTED=1',
+                  'LD_LIBRARY_PATH': '/host/lib', 'LD_PRELOAD': '/host/lib/x.so', 'LANG': 'C.UTF-8', 'LC_ALL': 'C',
+                  'HOME': '/home/u', 'USER': 'u', 'TERM': 'xterm'}
+        res = subprocess.run([wrapper, '-c', 'pass'], env=caller, capture_output=True, text=True)
+        self.assertEqual((res.returncode, res.stderr), (0, ''))
+        env = dict(line[4:].split('=', 1) for line in res.stdout.splitlines())
+        for name in ('PWD', 'SHLVL'):    # bash's own, passed on like any other
+            env.pop(name, None)
+        # the caller's variables go in as they are; the image's ENV wins over them (as under pyxis), site.env over
+        # both; PATH, LD_*, locale and the user's identity are the image's or enroot's, never the caller's; a value
+        # with a newline cannot be one line of enroot's environment file and stays out; enroot's own XDG_* too
+        self.assertEqual(env, {'PATH': '/image/bin', 'IMAGE_ONLY': 'image', 'SHARED': 'image',
+                               'OMP_NUM_THREADS': '1', 'APPTAINERENV_OMP_NUM_THREADS': '1',
+                               'CS_RUNTIME': 'sqsh', 'CS_GPU_DEVICE': '/nonexistent',
+                               'HF_HUB_OFFLINE': '1', 'NCCL_DEBUG': 'INFO', 'SPACED': ' a  b ', 'EMPTY': ''})
+
+    def _cs_python_env_runner(self):
+        """
+        A python wrapper with fake apptainer, srun and enroot that each print the value their runtime gives
+        PYTHONPATH, PYTHONHOME, PYTHONUSERBASE and PYTHONNOUSERSITE in the container (and srun its --container-env).
+        Returns run(runtime, image=None, site=None, caller=None) -> {name: value, 'container-env': ...}; the caller's
+        environment is a host Python module's (overridden by caller), image the image's ENV, site etc/site.env.
+        """
+        root, fake = os.path.join(self.tmpdir, 'install'), os.path.join(self.tmpdir, 'fake-enroot')
+        fakebin = os.path.join(self.tmpdir, 'fakebin')
+        names = ('PYTHONPATH', 'PYTHONHOME', 'PYTHONUSERBASE', 'PYTHONNOUSERSITE')
+        # each fake prints the value its runtime gives NAME in the container; the image's ENV is IMAGE_<NAME> here.
+        # Apptainer: APPTAINERENV_<NAME>, else image ENV, else the host's; pyxis: a --container-env name keeps the
+        # job's value, else image ENV, else the job's (enroot: CS_FAKE_ENROOT, with the image's /etc/environment)
+        loop = 'for n in %s; do\n    i=IMAGE_$n a=APPTAINERENV_$n\n%s    echo "IN $n=$v"\ndone\n'
+        write_file(os.path.join(fakebin, 'apptainer'), '#!/bin/bash\n' + loop % (' '.join(names), (
+            '    if [ -n "${!a+set}" ]; then v=${!a}; elif [ -n "${!i+set}" ]; then v=${!i}; else v=${!n-unset}; fi\n'
+        )))
+        write_file(os.path.join(fakebin, 'srun'), '#!/bin/bash\ncenv=,\nfor a in "$@"; do\n'
+                   '    case "$a" in --container-env=*) cenv=",${a#--container-env=},";; esac\ndone\n'
+                   'echo "IN container-env=$cenv"\n' +
+                   loop % (' '.join(names), (
+                       '    if [[ $cenv != *,$n,* ]] && [ -n "${!i+set}" ]; then v=${!i}; else v=${!n-unset}; fi\n')))
+        write_file(os.path.join(fakebin, 'enroot'), CS_FAKE_ENROOT.replace('@DIR@', fake))
+        for tool in ('apptainer', 'srun', 'enroot'):
+            adjust_permissions(os.path.join(fakebin, tool), stat.S_IXUSR, add=True)
+        for fmt in ('sqsh', 'sif'):
+            write_file(os.path.join(root, 'image.' + fmt), '')
+        write_file(os.path.join(root, containerstack.ENROOT_NO_ENTRYPOINT), containerstack.ENROOT_NO_ENTRYPOINT_CONF)
+        wrapper = os.path.join(root, 'bin', 'python')
+        # what a host Python module (e.g. Python 3.13 with packages) leaves in the caller's environment
+        host = {'PYTHONPATH': '/host/lib/python3.13/site-packages', 'PYTHONHOME': '/host/python/3.13',
+                'PYTHONUSERBASE': '/home/u/.local', 'PYTHONNOUSERSITE': '1'}
+
+        def run(runtime, image=None, site=None, caller=None):
+            # the wrapper as a build of this image renders it: with the image's ENV PYTHONPATH (None: it has none)
+            write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64, 'python', 'auto', [],
+                                                              image_pythonpath=(image or {}).get('PYTHONPATH')))
+            adjust_permissions(wrapper, stat.S_IXUSR, add=True)
+            write_file(os.path.join(root, 'etc', 'site.env'), ''.join('%s=%s\n' % kv for kv in (site or {}).items()))
+            write_file(os.path.join(fake, 'image-environment'),
+                       ''.join('%s=%s\n' % kv for kv in (image or {}).items()))
+            env = dict(host, PATH=fakebin + ':/usr/bin:/bin', CS_GPU_DEVICE='/nonexistent', CS_RUNTIME=runtime,
+                       SLURM_JOB_ID='42')
+            env.update(caller or {})
+            env.update(('IMAGE_' + k, v) for k, v in (image or {}).items())
+            res = subprocess.run([wrapper, '-c', 'pass'], env=env, capture_output=True, text=True)
+            self.assertEqual((res.returncode, res.stderr), (0, ''), runtime)
+            if runtime == 'sqsh':
+                got = dict(line[4:].split('=', 1) for line in res.stdout.splitlines())
+                return dict((n, got.get(n, 'unset')) for n in names)
+            return dict(line[3:].split('=', 1) for line in res.stdout.splitlines() if line.startswith('IN '))
+
+        return run
+
+    def test_containerstack_python_env_isolation(self):
+        """The caller's PYTHONPATH and PYTHONHOME never reach the container; image ENV and site.env still do."""
+        run = self._cs_python_env_runner()
+        for runtime in ('sif', 'sqsh', 'pyxis'):
+            # host interpreter paths mean nothing in the image: gone; the user-site settings go in as before
+            got = run(runtime)
+            got.pop('container-env', None)
+            self.assertEqual(got, {'PYTHONPATH': 'unset', 'PYTHONHOME': 'unset',
+                                   'PYTHONUSERBASE': '/home/u/.local', 'PYTHONNOUSERSITE': '1'}, runtime)
+            # the image's own ENV PYTHONPATH still applies, and site_env beats it
+            self.assertEqual(run(runtime, image={'PYTHONPATH': '/image/py'})['PYTHONPATH'], '/image/py', runtime)
+            got = run(runtime, image={'PYTHONPATH': '/image/py'}, site={'PYTHONPATH': '/site/py'})
+            got.pop('container-env', None)
+            self.assertEqual(got, {'PYTHONPATH': '/site/py', 'PYTHONHOME': 'unset', 'PYTHONUSERBASE': '/home/u/.local',
+                                   'PYTHONNOUSERSITE': '1'}, runtime)
+
+    def test_containerstack_cs_pythonpath(self):
+        """CS_PYTHONPATH goes first on the container's PYTHONPATH under every runtime, before the image's own ENV
+        PYTHONPATH (recorded at build time, kept verbatim); site.env beats both; the caller's PYTHONPATH stays out."""
+        run = self._cs_python_env_runner()
+        mine = {'CS_PYTHONPATH': '/home/u/Megatron-LM:/home/u/lib'}
+        # as in images that set ENV PYTHONPATH=/opt/NeMo-Framework-Launcher/launcher_scripts::/opt/megatron-lm,
+        # plus a space, a quote and a $ that must reach the container as they are
+        odd = "/opt/NeMo-Framework-Launcher/launcher_scripts::/opt/megatron-lm:/opt/my lib:/opt/it's$HOME"
+        for runtime in ('sif', 'sqsh', 'pyxis'):
+            self.assertEqual(run(runtime, caller=mine)['PYTHONPATH'], '/home/u/Megatron-LM:/home/u/lib', runtime)
+            self.assertEqual(run(runtime, image={'PYTHONPATH': '/image/py'}, caller=mine)['PYTHONPATH'],
+                             '/home/u/Megatron-LM:/home/u/lib:/image/py', runtime)
+            self.assertEqual(run(runtime, image={'PYTHONPATH': odd}, caller=mine)['PYTHONPATH'],
+                             '/home/u/Megatron-LM:/home/u/lib:' + odd, runtime)
+            # an image whose ENV sets PYTHONPATH empty: nothing to add, no trailing ':'
+            self.assertEqual(run(runtime, image={'PYTHONPATH': ''}, caller=mine)['PYTHONPATH'],
+                             '/home/u/Megatron-LM:/home/u/lib', runtime)
+            self.assertEqual(run(runtime, image={'PYTHONPATH': '/image/py'}, site={'PYTHONPATH': '/site/py'},
+                                 caller=mine)['PYTHONPATH'], '/site/py', runtime)
+            # empty: as if unset (the image's ENV applies untouched)
+            for value in ('', None):
+                caller = {} if value is None else {'CS_PYTHONPATH': value}
+                self.assertEqual(run(runtime, image={'PYTHONPATH': odd}, caller=caller)['PYTHONPATH'], odd, runtime)
+        # pyxis passes the name once, even when site.env sets it too
+        self.assertEqual(run('pyxis', caller=mine)['container-env'], ',PYTHONPATH,')
+        self.assertEqual(run('pyxis', site={'PYTHONPATH': '/site/py'}, caller=mine)['container-env'], ',PYTHONPATH,')
+
+    def test_containerstack_image_pythonpath(self):
+        """The build records the image's ENV PYTHONPATH (verbatim, or None) in manifest.json and renders it into the
+        wrappers, after CS_PYTHONPATH; a re-render without a build (--module-only) takes it from manifest.json."""
+        EasyBlock.sanity_check_step = lambda self, *args, **kwargs: None
+        self._cs_gpu(True)
+        fakebin = os.path.join(self.tmpdir, 'fakebin')
+        write_file(os.path.join(fakebin, 'apptainer'), '#!/bin/bash\necho "${APPTAINERENV_PYTHONPATH-unset}"\n')
+        adjust_permissions(os.path.join(fakebin, 'apptainer'), stat.S_IXUSR, add=True)
+
+        def container_pythonpath(eb):
+            res = subprocess.run([os.path.join(eb.installdir, 'bin', 'greet')], capture_output=True, text=True,
+                                 env={'PATH': fakebin + ':/usr/bin:/bin', 'CS_RUNTIME': 'sif',
+                                      'CS_PYTHONPATH': '/home/u/lib', 'CS_GPU_DEVICE': '/nonexistent'})
+            self.assertEqual((res.returncode, res.stderr), (0, ''))
+            return res.stdout[:-1]
+
+        odd = "/opt/launcher_scripts::/opt/megatron-lm:/opt/my lib:/opt/it's$HOME:/x=y"
+        for env, recorded in ((['PYTHONPATH=' + odd], odd), ([], None), (['PYTHONPATH='], ''),
+                              (['PYTHONPATH=/old', 'PYTHONPATH=/new'], '/new')):
+            eb, img = self._cs_easyblock(env=env)
+            with self.mocked_stdout_stderr():
+                eb.fetch_step()
+                eb.build_step()
+                eb.install_step()
+                eb.sanity_check_step()
+            manifest_path = os.path.join(eb.installdir, 'manifest.json')
+            self.assertEqual(json.loads(read_file(manifest_path))['image_pythonpath'], recorded, env)
+            expected = '/home/u/lib' + (':' + recorded if recorded else '')
+            self.assertEqual(container_pythonpath(eb), expected, env)
+            # --module-only: no build, so the value comes from manifest.json
+            eb, _ = self._cs_easyblock(env=env)
+            update_build_option('module_only', True)
+            os.remove(os.path.join(eb.installdir, 'bin', 'greet'))
+            eb.write_wrappers()
+            self.assertEqual(container_pythonpath(eb), expected, env)
+            update_build_option('module_only', False)
+        # an older manifest.json, without the key: as an image without PYTHONPATH
+        data = json.loads(read_file(manifest_path))
+        del data['image_pythonpath']
+        write_file(manifest_path, json.dumps(data))
+        eb, _ = self._cs_easyblock()
+        update_build_option('module_only', True)
+        eb.write_wrappers()
+        self.assertEqual(container_pythonpath(eb), '/home/u/lib')
+        # what the image config says: the last ENV PYTHONPATH, verbatim; None without one
+        for image_config, expected in (({'config': {'Env': ['PYTHONPATH=a::b c', 'X=1']}}, 'a::b c'),
+                                       ({'config': {'Env': ['PYTHONPATHX=1', 'MY_PYTHONPATH=2']}}, None),
+                                       ({'config': {'Env': None}}, None), ({'config': None}, None), ({}, None)):
+            self.assertEqual(containerstack.image_pythonpath(image_config), expected, image_config)
+
+    def _cs_fake_run(self, cmd, **kwargs):
+        """Stand-in for run_shell_cmd: records commands and fakes the files Apptainer/mksquashfs would make."""
+        self.cs_calls.append(cmd)
+        sandbox = re.search(r'apptainer build --force --sandbox (\S+) oci:', cmd)
+        image = re.search(r'apptainer build --force (\S+\.sif) oci:', cmd)
+        squash = re.search(r'^mksquashfs (\S+) (\S+) ', cmd)
+        if sandbox:
+            rootfs = sandbox.group(1)
+            for sub in ('.singularity.d/env', 'etc', 'usr/bin'):
+                mkdir(os.path.join(rootfs, sub), parents=True)
+            for name in ('.exec', '.run', '.shell', '.test'):
+                write_file(os.path.join(rootfs, name), '')
+            os.symlink('.singularity.d/env', os.path.join(rootfs, 'environment'))
+            os.symlink('.singularity.d', os.path.join(rootfs, 'singularity'))
+            for name in ('etc/hosts', 'etc/resolv.conf'):    # Apptainer's empty bind targets
+                write_file(os.path.join(rootfs, name), '')
+            mkdir(os.path.join(rootfs, 'var', 'empty'), parents=True)
+            os.chmod(os.path.join(rootfs, 'var', 'empty'), 0o555)
+            os.chmod(rootfs, 0o2750)
+        elif image:
+            write_file(image.group(1), 'sif image')
+        elif squash:
+            rootfs = squash.group(1)
+            self.cs_squashed = {'top': sorted(os.listdir(rootfs)),
+                                'modes': dict((rel, stat.S_IMODE(os.lstat(os.path.join(rootfs, rel)).st_mode))
+                                              for rel in ('', 'var/empty', 'etc/hosts')),
+                                'hosts': read_file(os.path.join(rootfs, 'etc', 'hosts')),
+                                'resolv': os.path.lexists(os.path.join(rootfs, 'etc', 'resolv.conf')),
+                                'rc': read_file(os.path.join(rootfs, 'etc', 'rc')),
+                                'environment': read_file(os.path.join(rootfs, 'etc', 'environment'))}
+            write_file(squash.group(2), 'sqsh image')
+        code, out = 0, 'fake 1.0\n'
+        for pattern, exit_code in self.cs_fail.items():
+            if pattern in cmd:
+                code, out = exit_code, 'boom\n'
+        return RunShellCmdResult(cmd=cmd, exit_code=code, output=out, stderr=None, work_dir=None, out_file=None,
+                                 err_file=None, cmd_sh=None, thread_id=None, task_id=None)
+
+    def _cs_easyblock(self, extra='', workdir='/work', user=None, env=()):
+        """ContainerStack instance for the tiny image in a fake registry, with mocked commands and paths."""
+        reg, img, _ = self._cs_registry(workdir=workdir, user=user, env=env)
+        ec_file = os.path.join(self.tmpdir, 'tiny-container-1.0.eb')
+        write_file(ec_file, textwrap.dedent("""
+            easyblock = 'ContainerStack'
+            name = 'tiny-container'
+            version = '1.0'
+            homepage = 'https://example.org'
+            description = 'ContainerStack test stack'
+            toolchain = SYSTEM
+            image = '%s/%s'
+            registry_scheme = 'http'
+            digests = {'x86_64': '%s'}
+            launchers = {'greet': 'cat /etc/greeting'}
+            site_env = {'OMP_NUM_THREADS': '1'}
+            smoke_tests = [('cpu', 'test -f /etc/greeting'), ('gpu', 'nvidia-smi -L')]
+            squash_options = '-noI -noD'
+        """) % (reg.address, reg.repo, img['manifest']) + extra)
+        easyconfig._easyconfigs_cache.clear()    # same path, new content: parse it again
+        eb = get_easyblock_instance(process_easyconfig(ec_file)[0])
+        eb.builddir = os.path.join(self.tmpdir, 'build')
+        mkdir(eb.builddir, parents=True)
+        eb.installdir = os.path.join(self.tmpdir, 'install')
+        containerstack.host_arch_key = lambda: 'x86_64'
+        containerstack.source_paths = lambda: [os.path.join(self.tmpdir, 'sources')]
+        containerstack.run_shell_cmd = self._cs_fake_run
+        return eb, img
+
+    def _cs_gpu(self, present):
+        """Point the GPU check (Python and wrappers) at an existing or a missing device file."""
+        path = os.path.join(self.tmpdir, 'nvidia0' if present else 'no-gpu')
+        if present:
+            write_file(path, '')
+        os.environ['CS_GPU_DEVICE'] = path
+
+    def test_containerstack_validation(self):
+        """Bad easyconfig values fail early with a message naming the parameter."""
+        cases = [("formats = ['tar']\n", "unknown format"), ("formats = []\n", "unknown format"),
+                 ("launch_policy = 'docker'\n", "launch_policy must be one of"),
+                 ("launchers = {'../x': 'ls'}\n", "invalid launcher name"),
+                 ("site_env = {'A': 1}\n", "site_env"), ("site_env = {'1A': 'x'}\n", "site_env"),
+                 ("smoke_tests = [('tpu', 'true')]\n", "smoke test"),
+                 ("image = 'nvcr.io/nvidia/pytorch:26.10'\n", "must not contain a tag"),
+                 ("image = None\n", "'image' is required")]
+        for extra, msg in cases:
+            eb, _ = self._cs_easyblock(extra)
+            self.assertRaisesRegex(EasyBuildError, msg, eb.fetch_step)
+
+    def test_containerstack_build_step(self):
+        """build_step makes the .sif from the verified layout and a clean enroot-style .sqsh, never appending."""
+        eb, img = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        layout = os.path.join(eb.builddir, 'oci-layout')
+        rootfs = os.path.join(eb.builddir, 'rootfs')
+        sif = [c for c in self.cs_calls if 'apptainer build --force %s/image.sif oci:%s' % (eb.builddir, layout) in c]
+        self.assertEqual(len(sif), 1)
+        self.assertIn('APPTAINER_TMPDIR=%s/tmp' % eb.builddir, sif[0])
+        squash = [c for c in self.cs_calls if c.startswith('mksquashfs ')]
+        self.assertEqual(squash, ['mksquashfs %s %s/image.sqsh -noappend -all-root -no-progress -noI -noD'
+                                  % (rootfs, eb.builddir)])
+        self.assertEqual(self.cs_squashed['top'], ['etc', 'usr', 'var', 'work'])
+        # as 'enroot import' makes it: the image's /etc/hosts (not Apptainer's empty one), no /etc/resolv.conf
+        # the image lacks, user-writable directories and a 0755 root
+        self.assertEqual(self.cs_squashed['hosts'], '127.0.0.1 localhost\n')
+        self.assertFalse(self.cs_squashed['resolv'])
+        self.assertEqual(self.cs_squashed['modes'], {'': 0o755, 'var/empty': 0o755, 'etc/hosts': 0o640})
+        self.assertTrue(self.cs_squashed['rc'].startswith('# enroot-provenance: containerstack://%s@%s\n'
+                                                          % (eb.cfg['image'], img['manifest'])))
+        self.assertEqual(self.cs_squashed['environment'], 'PATH=/usr/bin:/bin\nGREETING=hello world\n')
+        self.assertFalse(os.path.exists(rootfs))
+        # only the requested formats are built
+        self.cs_calls = []
+        eb, _ = self._cs_easyblock("formats = ['sif']\n")
+        eb.fetch_step()
+        eb.build_step()
+        self.assertEqual([c for c in self.cs_calls if 'mksquashfs' in c or '--sandbox' in c], [])
+
+    def test_containerstack_non_root_user(self):
+        """A non-root image User is ignored as enroot import ignores it, with a build warning and in manifest.json."""
+        EasyBlock.sanity_check_step = lambda self, *args, **kwargs: None
+        self._cs_gpu(True)
+        etc = {}
+        for user, recorded in ((None, None), ('', None), ('root', 'root'), ('0:0', '0:0'), (':1000', ':1000'),
+                               ('1000:1000', '1000:1000'), ('appuser', 'appuser'), (1000, '1000')):
+            eb, _ = self._cs_easyblock(user=user)
+            with self.mocked_stdout_stderr() as (stdout, stderr):
+                eb.fetch_step()
+                eb.build_step()
+                eb.install_step()
+                eb.sanity_check_step()
+            output = stdout.getvalue() + stderr.getvalue()
+            warning = ("image sets User %r, which enroot and Apptainer ignore: the container runs as the calling user "
+                       "(or as root with enroot --root, pyxis --container-remap-root or apptainer --fakeroot), not as "
+                       "%s" % (recorded, recorded))
+            self.assertEqual(warning in output, recorded in ('1000:1000', 'appuser', '1000'), (user, output))
+            self.assertEqual(output.count('image sets User'), int(warning in output), output)
+            manifest = json.loads(read_file(os.path.join(eb.installdir, 'manifest.json')))
+            self.assertEqual(manifest['image_user'], recorded)
+            etc[user] = (self.cs_squashed['rc'].split('\n', 1)[1], self.cs_squashed['environment'])
+        # OCI image config User: '' means the default user (root); 'user', 'uid', 'user:group' or 'uid:gid', where
+        # an empty user part (':1000') also means the default user (root, here with group 1000)
+        for user, expected in ((None, (None, False)), ('', (None, False)), ('  ', (None, False)),
+                               ('0', ('0', False)), ('00', ('00', False)), ('0:0', ('0:0', False)), (0, ('0', False)),
+                               ('root', ('root', False)), ('root:x', ('root:x', False)), (':1000', (':1000', False)),
+                               ('1000', ('1000', True)), ('1000:0', ('1000:0', True)), ('appuser', ('appuser', True)),
+                               (1000, ('1000', True)), (' appuser ', ('appuser', True))):
+            config = {'config': {} if user is None else {'User': user}}
+            self.assertEqual(containerstack.image_user(config), expected, repr(user))
+        self.assertEqual(containerstack.image_user({}), (None, False))
+        # the .sqsh's /etc files do not depend on User, as with enroot import (docker::configure never reads it)
+        self.assertEqual(len(set(etc.values())), 1, etc)
+        casedir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'containerstack_enroot', 'nginx')
+        config = json.loads(read_file(os.path.join(casedir, 'config.json')))
+        config['config']['User'] = '101:101'
+        files = containerstack.enroot_files(config, 'p')
+        for rel in ('etc/environment', 'etc/fstab', 'etc/rc.local'):
+            self.assertEqual(files[rel], read_file(os.path.join(casedir, os.path.basename(rel))), rel)
+        self.assertEqual(files['etc/rc'].split('\n', 1)[1], read_file(os.path.join(casedir, 'rc')).split('\n', 1)[1])
+
+    def test_containerstack_image_entries(self):
+        """image_entries applies layers in order, with OCI whiteouts and opaque directories."""
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        layers = []
+        for members in ([('etc/hosts', b'one\n'), ('etc/resolv.conf', b'ns\n'), ('etc/a/x', b'x\n')],
+                        [('etc/.wh.resolv.conf', b''), ('etc/a/.wh..wh..opq', b''), ('./etc/hosts', b'two\n')]):
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode='w:gz') as tar:
+                for name, data in members:
+                    info = tarfile.TarInfo(name)
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+            digest = containerstack.sha256_digest(buf.getvalue())
+            path = containerstack.blob_path(blobs, digest)
+            mkdir(os.path.dirname(path), parents=True)
+            with open(path, 'wb') as fh:
+                fh.write(buf.getvalue())
+            layers.append({'digest': digest})
+        found = containerstack.image_entries(blobs, layers, ('etc/hosts', 'etc/resolv.conf', 'etc/a/x', 'etc/no'))
+        self.assertEqual(found['etc/hosts'][1], b'two\n')
+        self.assertEqual([found[p] for p in ('etc/resolv.conf', 'etc/a/x', 'etc/no')], [None, None, None])
+        self.assertEqual(containerstack.image_entries(blobs, layers[:1], ('etc/a/x',))['etc/a/x'][1], b'x\n')
+
+    def test_containerstack_image_entries_root_opaque_and_replaced_dirs(self):
+        """An opaque whiteout at the image root clears all lower layers; a non-directory hides what was beneath."""
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        lower = _cs_layer(blobs, [_cs_member('etc/hosts', b'one\n'), _cs_member('usr/lib/x', b'x\n'),
+                                  _cs_member('opt/y', b'y\n')])
+        root_opq = _cs_layer(blobs, [_cs_member('./.wh..wh..opq'), _cs_member('opt/y', b'new y\n')])
+        found = containerstack.image_entries(blobs, [lower, root_opq], ('etc/hosts', 'usr/lib/x', 'opt/y'))
+        self.assertEqual(found['etc/hosts'], None)
+        self.assertEqual(found['usr/lib/x'], None)
+        self.assertEqual(found['opt/y'][1], b'new y\n')    # same-layer entries survive the opaque marker
+        replaced = _cs_layer(blobs, [_cs_member('etc', kind=tarfile.SYMTYPE, linkname='private/etc'),
+                                     _cs_member('usr/lib', b'now a file\n')])
+        found = containerstack.image_entries(blobs, [lower, replaced], ('etc/hosts', 'usr/lib/x', 'opt/y', 'etc'))
+        self.assertEqual([found[p] for p in ('etc/hosts', 'usr/lib/x')], [None, None])
+        self.assertEqual(found['opt/y'][1], b'y\n')
+        self.assertTrue(found['etc'][0].issym())
+        # a later layer that has 'etc' as a directory again keeps the lower layer's files
+        etc_dir = _cs_layer(blobs, [_cs_member('etc', kind=tarfile.DIRTYPE, mode=0o755)])
+        self.assertEqual(containerstack.image_entries(blobs, [lower, etc_dir], ('etc/hosts',))['etc/hosts'][1],
+                         b'one\n')
+
+    def _cs_without_zstd_tarfile(self):
+        """Hide this Python's tarfile zstd support (as before Python 3.14) until the test ends."""
+        orig = tarfile.TarFile.OPEN_METH
+        tarfile.TarFile.OPEN_METH = dict((k, v) for k, v in orig.items() if k != 'zst')
+        self.addCleanup(setattr, tarfile.TarFile, 'OPEN_METH', orig)
+
+    def test_containerstack_zstd_layer_no_reader(self):
+        """A zstd layer with neither tarfile zstd support nor a zstd command: an error naming layer and tool."""
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        members = [_cs_member('etc/hosts', b'zstd hosts\n')]
+        if shutil.which('zstd'):
+            layer = _cs_layer(blobs, members, zstd=True)
+        else:    # the content is never read: the missing reader is reported first
+            layer = dict(_cs_layer(blobs, members), mediaType='application/vnd.oci.image.layer.v1.tar+zstd')
+        self._cs_without_zstd_tarfile()
+        os.environ['PATH'] = os.path.join(self.tmpdir, 'empty-path')
+        self.assertRaisesRegex(EasyBuildError, "layer %s is zstd-compressed.*no 'zstd' command" % layer['digest'],
+                               containerstack.image_entries, blobs, [layer], ('etc/hosts',))
+
+    def test_containerstack_zstd_layer_via_command(self):
+        """Without tarfile zstd support, a zstd layer is read through the zstd command."""
+        if not shutil.which('zstd'):
+            self.skipTest("no 'zstd' command in $PATH")
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        layers = [_cs_layer(blobs, [_cs_member('etc/hosts', b'one\n'), _cs_member('etc/resolv.conf', b'ns\n')]),
+                  _cs_layer(blobs, [_cs_member('etc/hosts', b'zstd hosts\n', mode=0o600),
+                                    _cs_member('etc/.wh.resolv.conf')], zstd=True)]
+        if containerstack.tarfile_reads_zstd():    # Python >= 3.14: tarfile itself
+            self.assertEqual(containerstack.image_entries(blobs, layers, ('etc/hosts',))['etc/hosts'][1],
+                             b'zstd hosts\n')
+        self._cs_without_zstd_tarfile()
+        self.assertFalse(containerstack.tarfile_reads_zstd())
+        found = containerstack.image_entries(blobs, layers, ('etc/hosts', 'etc/resolv.conf'))
+        self.assertEqual((found['etc/hosts'][1], found['etc/hosts'][0].mode), (b'zstd hosts\n', 0o600))
+        self.assertEqual(found['etc/resolv.conf'], None)
+
+    def test_containerstack_zstd_layer_hard_link(self):
+        """A hard link's data (that of the member it links to) is found also in a zstd layer streamed by zstd -d."""
+        if not shutil.which('zstd'):
+            self.skipTest("no 'zstd' command in $PATH")
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        members = [_cs_member('etc/hosts.orig', b'old\n'), _cs_member('etc/hosts.orig', b'linked hosts\n'),
+                   _cs_member('./etc/hosts', kind=tarfile.LNKTYPE, mode=0o640, linkname='./etc/hosts.orig'),
+                   _cs_member('etc/resolv.conf', kind=tarfile.LNKTYPE, linkname='etc/hosts.orig'),
+                   _cs_member('etc/hosts.orig', b'replaced after the links\n')]
+        layers = [_cs_layer(blobs, members, zstd=True)]
+        paths = ('etc/hosts', 'etc/resolv.conf')
+        readers = ([True] if containerstack.tarfile_reads_zstd() else []) + [False]    # True: Python >= 3.14
+        for native in readers:
+            if not native:
+                self._cs_without_zstd_tarfile()
+            found = containerstack.image_entries(blobs, layers, paths)
+            self.assertTrue(found['etc/hosts'][0].islnk())
+            self.assertEqual((found['etc/hosts'][1], found['etc/hosts'][0].mode), (b'linked hosts\n', 0o640))
+            self.assertEqual(found['etc/resolv.conf'][1], b'linked hosts\n')
+        dangling = _cs_layer(blobs, [_cs_member('etc/hosts', kind=tarfile.LNKTYPE, linkname='etc/nowhere')],
+                             zstd=True)
+        self.assertRaisesRegex(EasyBuildError, "hard link etc/hosts .* links to etc/nowhere",
+                               containerstack.image_entries, blobs, [dangling], paths)
+
+    def test_containerstack_hard_link_chain(self):
+        """Hard links to hard links resolve as tarfile does, in gzip and zstd layers; a gzip layer is read once."""
+        blobs = os.path.join(self.tmpdir, 'blobs')
+
+        def members():
+            return [_cs_member('etc/a', b'first a\n'), _cs_member('etc/b', kind=tarfile.LNKTYPE, linkname='etc/a'),
+                    _cs_member('etc/a', b'a after b\n'),
+                    _cs_member('etc/hosts', kind=tarfile.LNKTYPE, mode=0o640, linkname='./etc/b'),
+                    _cs_member('etc/resolv.conf', kind=tarfile.LNKTYPE, linkname='etc/hosts')]
+        paths = ('etc/hosts', 'etc/resolv.conf')
+        dangling = [_cs_member('etc/b', kind=tarfile.LNKTYPE, linkname='etc/nowhere'),
+                    _cs_member('etc/hosts', kind=tarfile.LNKTYPE, linkname='etc/b')]
+        kinds = [False] + (['native', 'command'] if shutil.which('zstd') else [])
+        for zstd in kinds:
+            if zstd == 'command':
+                self._cs_without_zstd_tarfile()
+            elif zstd == 'native' and not containerstack.tarfile_reads_zstd():
+                continue
+            layer = _cs_layer(blobs, members(), zstd=bool(zstd))
+            orig_open_layer = containerstack.open_layer
+            with mock.patch.object(containerstack, 'open_layer', side_effect=orig_open_layer) as opened:
+                found = containerstack.image_entries(blobs, [layer], paths)
+            # what tarfile itself reads for them: etc/b links to the etc/a before it
+            self.assertEqual([found[p][1] for p in paths], [b'first a\n', b'first a\n'], zstd)
+            self.assertEqual(found['etc/hosts'][0].mode, 0o640)
+            self.assertEqual(opened.call_count, 2 if zstd == 'command' else 1, zstd)
+            self.assertRaisesRegex(EasyBuildError, "hard link etc/hosts .* links to etc/b, which is not a file",
+                                   containerstack.image_entries, blobs, [_cs_layer(blobs, dangling, zstd=bool(zstd))],
+                                   paths)
+
+    def test_containerstack_hard_link_resolution(self):
+        """Hard links resolve alike in gzip, native zstd and zstd-command layers: absolute targets, to symlinks."""
+        blobs = os.path.join(self.tmpdir, 'blobs')
+
+        def members():
+            return [_cs_member('etc/real', b'real\n'),
+                    _cs_member('etc/hosts', kind=tarfile.LNKTYPE, mode=0o640, linkname='/etc/real'),
+                    _cs_member('etc/sym', kind=tarfile.SYMTYPE, linkname='real'),
+                    _cs_member('etc/abssym', kind=tarfile.SYMTYPE, linkname='/etc/real'),
+                    _cs_member('etc/resolv.conf', kind=tarfile.LNKTYPE, linkname='etc/sym'),
+                    _cs_member('etc/abs', kind=tarfile.LNKTYPE, linkname='./etc/abssym'),
+                    _cs_member('etc/real', b'real, archived later\n')]
+        paths = ('etc/hosts', 'etc/resolv.conf', 'etc/abs')
+        kinds = [False] + (['native', 'command'] if shutil.which('zstd') else [])
+        for zstd in kinds:
+            if zstd == 'command':
+                self._cs_without_zstd_tarfile()
+            elif zstd == 'native' and not containerstack.tarfile_reads_zstd():
+                continue
+            layer = _cs_layer(blobs, members(), zstd=bool(zstd))
+            orig_open_layer = containerstack.open_layer
+            with mock.patch.object(containerstack, 'open_layer', side_effect=orig_open_layer) as opened:
+                found = containerstack.image_entries(blobs, [layer], paths)
+            # an absolute target is an image path ('/etc/real' is etc/real), the last such member before the link;
+            # a hard link to a symlink reads what the symlink points to, as tarfile does: relative to the symlink's
+            # directory (an absolute target: from the image root), the last member of that name in the whole layer
+            self.assertEqual([found[p][1] for p in paths], [b'real\n', b'real, archived later\n',
+                                                            b'real, archived later\n'], zstd)
+            self.assertTrue(found['etc/hosts'][0].islnk())
+            self.assertEqual(found['etc/hosts'][0].mode, 0o640)
+            self.assertEqual(opened.call_count, 2 if zstd == 'command' else 1, zstd)
+
+    def test_containerstack_hard_link_symlink_loop(self):
+        """A hard link through a symlink loop, or through more links than the kernel follows, says so."""
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        too_many = "hard link etc/hosts: too many levels of symbolic links \\(loop or > 40\\) in layer sha256:"
+        loop = _cs_layer(blobs, [_cs_member('etc/a', kind=tarfile.SYMTYPE, linkname='b'),
+                                 _cs_member('etc/b', kind=tarfile.SYMTYPE, linkname='a'),
+                                 _cs_member('etc/hosts', kind=tarfile.LNKTYPE, linkname='etc/a')])
+        self.assertRaisesRegex(EasyBuildError, too_many, containerstack.image_entries, blobs, [loop], ['etc/hosts'])
+
+        def chain(links):
+            """etc/hosts: a hard link to etc/s1, a symlink to s2, ... to s<links - 1>, a symlink to the file etc/real"""
+            members = [_cs_member('etc/real', b'real\n')]
+            members += [_cs_member('etc/s%d' % i, kind=tarfile.SYMTYPE, linkname='s%d' % (i + 1))
+                        for i in range(1, links - 1)]
+            members += [_cs_member('etc/s%d' % (links - 1), kind=tarfile.SYMTYPE, linkname='real'),
+                        _cs_member('etc/hosts', kind=tarfile.LNKTYPE, linkname='etc/s1')]
+            return containerstack.image_entries(blobs, [_cs_layer(blobs, members)], ['etc/hosts'])
+
+        # the hard link and 39 symlinks are 40 links: followed; one more is too many
+        self.assertEqual(chain(40)['etc/hosts'][1], b'real\n')
+        self.assertRaisesRegex(EasyBuildError, too_many, chain, 41)
+        # a link to nothing is still that
+        dangling = _cs_layer(blobs, [_cs_member('etc/a', kind=tarfile.SYMTYPE, linkname='nowhere'),
+                                     _cs_member('etc/hosts', kind=tarfile.LNKTYPE, linkname='etc/a')])
+        self.assertRaisesRegex(EasyBuildError, "hard link etc/hosts .* links to etc/a, which is not a file",
+                               containerstack.image_entries, blobs, [dangling], ['etc/hosts'])
+
+    def test_containerstack_fixperms(self):
+        """enroot's fixperms: chmod -R u+rX, then u+w on directories as deep as enroot's find reaches them."""
+        root = os.path.join(self.tmpdir, 'rootfs')
+        outside = os.path.join(self.tmpdir, 'outside')
+        deep = [os.path.join(root, *['n%d' % i for i in range(1, depth + 1)]) for depth in range(1, 17)]
+        mkdir(deep[-1], parents=True)
+        mkdir(os.path.join(root, 'locked'))
+        mkdir(os.path.join(outside, 'dir'), parents=True)
+        files = {'f0000': 0o000, 'f0644': 0o644, 'f0700': 0o700, 'f0055': 0o055, 'locked/inner': 0o000,
+                 os.path.join(outside, 'target'): 0o000, os.path.join(outside, 'dir', 'g'): 0o000}
+        for rel, mode in files.items():
+            write_file(os.path.join(root, rel), 'x')
+        os.symlink(os.path.join(outside, 'target'), os.path.join(root, 'link'))
+        os.symlink(os.path.join(outside, 'dir'), os.path.join(root, 'dirlink'))
+        if hasattr(os, 'lchmod'):    # macOS: a symlink has a mode of its own; a chmod of the link must not happen
+            os.lchmod(os.path.join(root, 'link'), 0o000)
+        dirs = {'locked': 0o000, 'n1/n2': 0o555, deep[13]: 0o555, deep[14]: 0o555, deep[15]: 0o555,
+                os.path.join(outside, 'dir'): 0o555}
+        for rel, mode in list(files.items()) + sorted(dirs.items(), key=lambda kv: -len(kv[0])):
+            os.chmod(os.path.join(root, rel), mode)
+        try:
+            containerstack.enroot_fixperms(root)
+            modes = dict((rel, stat.S_IMODE(os.lstat(os.path.join(root, rel)).st_mode))
+                         for rel in list(files) + list(dirs))
+        finally:    # tearDown only adds u+w
+            os.chmod(os.path.join(root, 'locked'), 0o700)
+
+        def mode(rel):
+            return modes[rel]
+        # u+r everywhere; u+x on directories and on files that anyone may execute (X); never through a symlink
+        self.assertEqual(dict((rel, mode(rel)) for rel in files),
+                         {'f0000': 0o400, 'f0644': 0o644, 'f0700': 0o700, 'f0055': 0o555, 'locked/inner': 0o400,
+                          os.path.join(outside, 'target'): 0o000, os.path.join(outside, 'dir', 'g'): 0o000})
+        self.assertEqual(mode(os.path.join(outside, 'dir')), 0o555)
+        self.assertTrue(os.path.islink(os.path.join(root, 'link')) and os.path.islink(os.path.join(root, 'dirlink')))
+        # u+w on directories: enroot runs 'find . -maxdepth 15' in the directory holding one directory per layer,
+        # so an image directory n levels below the rootfs is at find depth n + 1
+        self.assertEqual((mode('locked'), mode('n1/n2')), (0o700, 0o755))
+        self.assertEqual([mode(d) for d in deep[13:]], [0o755, 0o555, 0o555])
+
+    def test_containerstack_sqsh_symlink_bind_target(self):
+        """An image whose /etc/hosts is a symlink gets that symlink back in the .sqsh, not Apptainer's file."""
+        seen = {}
+
+        def run(cmd, **kwargs):
+            sandbox = re.search(r'--sandbox (\S+) ', cmd)
+            if cmd.startswith('mksquashfs '):
+                hosts = os.path.join(cmd.split()[1], 'etc', 'hosts')
+                seen['hosts'] = os.readlink(hosts) if os.path.islink(hosts) else None
+            res = self._cs_fake_run(cmd, **kwargs)
+            if sandbox:
+                write_file(os.path.join(sandbox.group(1), 'etc', 'hosts.image'), 'via the image link\n')
+            return res
+
+        info = _cs_member('etc/hosts', kind=tarfile.SYMTYPE, linkname='hosts.image')[0]
+        orig = containerstack.image_entries
+        containerstack.image_entries = lambda *args: {'etc/hosts': (info, None), 'etc/resolv.conf': None}
+        self.addCleanup(setattr, containerstack, 'image_entries', orig)
+        eb, _ = self._cs_easyblock("formats = ['sqsh']\n")
+        eb.fetch_step()
+        containerstack.run_shell_cmd = run
+        eb.build_step()
+        self.assertEqual(seen['hosts'], 'hosts.image')
+        self.assertEqual(self.cs_squashed['hosts'], 'via the image link\n')
+
+    def test_containerstack_sqsh_root_mode_from_umask(self):
+        """The .sqsh root directory has the mode a plain mkdir gives it, as in 'enroot import': 0777 & ~umask."""
+        for umask, expected in ((0o022, 0o755), (0o002, 0o775)):
+            eb, _ = self._cs_easyblock("formats = ['sqsh']\n")
+            eb.fetch_step()
+            old = os.umask(umask)
+            try:
+                eb.build_step()
+                self.assertEqual(os.umask(umask), umask)    # the umask is left as it was
+            finally:
+                os.umask(old)
+            self.assertEqual(self.cs_squashed['modes'][''], expected)
+
+    def test_containerstack_rootfs_writes_stay_inside(self):
+        """enroot's /etc files replace image symlinks instead of writing through them; no write escapes the rootfs."""
+        outside = os.path.join(self.tmpdir, 'host')
+        write_file(os.path.join(outside, 'rc'), 'host file\n')
+        plant, seen = {}, {}
+
+        def run(cmd, **kwargs):
+            if cmd.startswith('mksquashfs '):
+                rc = os.path.join(cmd.split()[1], 'etc', 'rc')
+                seen['rc'] = (os.path.islink(rc), os.path.isfile(rc))
+            res = self._cs_fake_run(cmd, **kwargs)
+            sandbox = re.search(r'--sandbox (\S+) ', cmd)
+            if sandbox:
+                for rel, dest in plant.items():
+                    path = os.path.join(sandbox.group(1), rel)
+                    if os.path.isdir(path):
+                        remove_dir(path)
+                    os.symlink(dest, path)
+            return res
+
+        eb, _ = self._cs_easyblock("formats = ['sqsh']\n")
+        eb.fetch_step()
+        containerstack.run_shell_cmd = run
+        plant = {'etc/rc': os.path.join(outside, 'rc')}
+        eb.build_step()
+        self.assertEqual(read_file(os.path.join(outside, 'rc')), 'host file\n')
+        self.assertEqual(seen['rc'], (False, True))
+        self.assertTrue(self.cs_squashed['rc'].startswith('# enroot-provenance: '))
+        # an image whose /etc is an absolute symlink would resolve on the host: refused
+        plant = {'etc': outside}
+        self.assertRaisesRegex(EasyBuildError, "outside the image rootfs", eb.build_step)
+        self.assertEqual(sorted(os.listdir(outside)), ['rc'])
+        self.assertEqual(read_file(os.path.join(outside, 'rc')), 'host file\n')
+        remove_dir(os.path.join(eb.builddir, 'rootfs'))    # apptainer build --force would replace it
+        # a WorkingDir with '..' (rootfs is <tmpdir>/build/rootfs) would make the mkdir escape: refused
+        eb, _ = self._cs_easyblock("formats = ['sqsh']\n", workdir='/../../x')
+        eb.fetch_step()
+        self.assertRaisesRegex(EasyBuildError, "outside the image rootfs", eb.build_step)
+        self.assertFalse(os.path.exists(os.path.join(self.tmpdir, 'x')))
+
+    def test_containerstack_free_space(self):
+        """build_step refuses to start without min_free_space_factor x the image size free."""
+        eb, _ = self._cs_easyblock()
+        eb.fetch_step()
+        containerstack.disk_free = lambda path: 10
+        self.cs_calls = []
+        self.assertRaisesRegex(EasyBuildError, r"GiB free in .*, need .* GiB \(3x the image size\)", eb.build_step)
+        self.assertEqual([c for c in self.cs_calls if 'apptainer' in c or 'mksquashfs' in c], [])
+
+    def test_containerstack_install_step(self):
+        """install_step copies images and writes wrappers and site.env, but no manifest yet."""
+        eb, _ = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        for rel in ('image.sif', 'image.sqsh', 'bin/greet', 'bin/.cs-run', 'etc/site.env'):
+            self.assertTrue(os.path.isfile(os.path.join(eb.installdir, rel)), rel)
+        self.assertTrue(os.access(os.path.join(eb.installdir, 'bin', 'greet'), os.X_OK))
+        self.assertEqual(read_file(os.path.join(eb.installdir, 'etc', 'site.env')), 'OMP_NUM_THREADS=1\n')
+        self.assertIn('cmd=(cat /etc/greeting)', read_file(os.path.join(eb.installdir, 'bin', 'greet')))
+        self.assertIn('cmd=()', read_file(os.path.join(eb.installdir, 'bin', '.cs-run')))
+        self.assertFalse(os.path.exists(os.path.join(eb.installdir, 'manifest.json')))
+
+    def test_containerstack_sanity_check_paths(self):
+        """The sanity check requires every installed file, including the enroot hook the wrappers use with sqsh."""
+        paths = []
+        EasyBlock.sanity_check_step = lambda self, *args, **kwargs: paths.append(kwargs['custom_paths'])
+        eb, _ = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        self._cs_gpu(True)
+        eb.sanity_check_step()
+        self.assertEqual(sorted(paths[-1]['files']), ['bin/.cs-run', 'bin/greet', 'etc/enroot-no-entrypoint.conf',
+                                                      'etc/site.env', 'image.sif', 'image.sqsh'])
+        for rel in paths[-1]['files']:
+            self.assertTrue(os.path.isfile(os.path.join(eb.installdir, rel)), rel)
+        # without sqsh there is no enroot, so no hook to require
+        eb.cfg['formats'] = ['sif']
+        eb.sanity_check_step()
+        self.assertNotIn('etc/enroot-no-entrypoint.conf', paths[-1]['files'])
+
+    def test_containerstack_smoke_tests(self):
+        """Every smoke test runs in every format via bin/.cs-run; a missing GPU fails unless explicitly allowed."""
+        eb, _ = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        self._cs_gpu(False)
+        self.cs_calls = []
+        self.assertRaisesRegex(EasyBuildError, "GPU smoke test 'nvidia-smi -L' cannot run: no GPU", eb.run_smoke_tests)
+        self.assertEqual([c for c in self.cs_calls if '.cs-run' in c], [])    # fails before running anything
+        self._cs_gpu(True)
+        results = eb.run_smoke_tests()
+        self.assertEqual([(r['format'], r['kind'], r['result']) for r in results],
+                         [('sqsh', 'cpu', 'pass'), ('sqsh', 'gpu', 'pass'), ('sif', 'cpu', 'pass'),
+                          ('sif', 'gpu', 'pass')])
+        runner = os.path.join(eb.installdir, 'bin', '.cs-run')
+        self.assertTrue(any(c.startswith('CS_RUNTIME=apptainer %s sh -c ' % runner) for c in self.cs_calls))
+        self.assertTrue(any(c.startswith('CS_RUNTIME=enroot ENROOT_DATA_PATH=') for c in self.cs_calls))
+        self.cs_fail = {'test -f /etc/greeting': 1}
+        self.assertRaisesRegex(EasyBuildError, r"cpu smoke test failed in sqsh \(exit 1\): test -f /etc/greeting",
+                               eb.run_smoke_tests)
+        self.cs_fail = {}
+        eb, _ = self._cs_easyblock("require_gpu_tests = False\n")
+        eb.fetch_step()
+        self._cs_gpu(False)
+        results = eb.run_smoke_tests()
+        self.assertEqual(sorted({r['result'] for r in results if r['kind'] == 'gpu'}), ['not-run: no GPU'])
+
+    def test_containerstack_smoke_failure_removes_enroot_container(self):
+        """A failing enroot smoke test still removes the unpacked enroot container."""
+        eb, _ = self._cs_easyblock()
+        eb.fetch_step()
+        self._cs_gpu(True)
+        self.cs_fail = {'test -f /etc/greeting': 1}
+        self.assertRaisesRegex(EasyBuildError, "cpu smoke test failed in sqsh", eb.run_smoke_tests)
+        self.assertTrue(re.search(r'ENROOT_DATA_PATH=\S+ enroot remove -f', self.cs_calls[-1]), self.cs_calls[-1])
+
+    def test_containerstack_require_gpu_without_gpu_tests(self):
+        """require_gpu_tests = True with no 'gpu' smoke test is a recipe error, with or without a GPU."""
+        eb, _ = self._cs_easyblock("require_gpu_tests = True\nsmoke_tests = [('cpu', 'true')]\n")
+        eb.fetch_step()
+        for present in (False, True):
+            self._cs_gpu(present)
+            self.assertRaisesRegex(EasyBuildError, "require_gpu_tests is set but no smoke test is tagged gpu",
+                                   eb.run_smoke_tests)
+
+    def test_containerstack_no_manifest_on_failure(self):
+        """manifest.json appears only after every smoke test passed, and records what was installed."""
+        EasyBlock.sanity_check_step = lambda self, *args, **kwargs: None
+        eb, img = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        self._cs_gpu(True)
+        manifest_path = os.path.join(eb.installdir, 'manifest.json')
+        self.cs_fail = {'nvidia-smi -L': 3}
+        self.assertRaisesRegex(EasyBuildError, "smoke test failed", eb.sanity_check_step)
+        self.assertFalse(os.path.exists(manifest_path))
+        self.cs_fail = {}
+        eb.sanity_check_step()
+        manifest = json.loads(read_file(manifest_path))
+        self.assertEqual((manifest['digest'], manifest['arch'], manifest['layers']),
+                         (img['manifest'], 'x86_64', [img['layer']]))
+        self.assertEqual(sorted(manifest['files']), ['image.sif', 'image.sqsh'])
+        self.assertEqual(len(manifest['files']['image.sif']['sha256']), 71)
+        self.assertEqual(len(manifest['smoke_tests']), 4)
+        self.assertEqual(manifest['runtimes']['apptainer'], 'fake 1.0')
+
+    def test_containerstack_smoke_logs(self):
+        """A passing sanity check leaves each smoke test's output per format in smoke/, read-only like the rest."""
+        EasyBlock.sanity_check_step = lambda self, *args, **kwargs: None
+        eb, _ = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        self._cs_gpu(True)
+        eb.sanity_check_step()
+        smoke = os.path.join(eb.installdir, 'smoke')
+        logs = ['1-cpu.sif.log', '1-cpu.sqsh.log', '2-gpu.sif.log', '2-gpu.sqsh.log']
+        self.assertEqual(sorted(os.listdir(smoke)), logs)
+        for log in logs:
+            self.assertEqual(read_file(os.path.join(smoke, log)), 'fake 1.0\n', log)
+        eb.permissions_step()
+        if os.geteuid() != 0:
+            self.assertFalse(os.access(os.path.join(smoke, logs[0]), os.W_OK))
+
+    def test_containerstack_module_only(self):
+        """--module-only (promotion) checks the existing manifest and never re-runs or rewrites anything."""
+        EasyBlock.sanity_check_step = lambda self, *args, **kwargs: None
+        eb, img = self._cs_easyblock()
+        manifest_path = os.path.join(eb.installdir, 'manifest.json')
+        update_build_option('module_only', True)
+        self.assertRaisesRegex(EasyBuildError, "has no manifest.json", eb.sanity_check_step)
+        write_file(manifest_path, json.dumps({'digest': 'sha256:' + 'b' * 64}))
+        self.assertRaisesRegex(EasyBuildError, "built from sha256:b+ but the recipe pins", eb.sanity_check_step)
+        write_file(manifest_path, json.dumps({'digest': img['manifest']}))
+        self.cs_calls = []
+        eb.sanity_check_step()
+        self.assertEqual(self.cs_calls, [])
+        self.assertEqual(json.loads(read_file(manifest_path)), {'digest': img['manifest']})
+        # --sanity-check-only re-runs the smoke tests but still never rewrites the manifest
+        update_build_option('module_only', False)
+        update_build_option('sanity_check_only', True)
+        self._cs_gpu(True)
+        eb.sanity_check_step()
+        self.assertTrue(any('.cs-run' in c for c in self.cs_calls))
+        self.assertEqual(json.loads(read_file(manifest_path)), {'digest': img['manifest']})
+
+    def test_containerstack_skip_existing(self):
+        """eb --skip on an existing install only checks its manifest: no smoke tests, no rewrite."""
+        EasyBlock.sanity_check_step = lambda self, *args, **kwargs: None
+        eb, img = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        manifest_path = os.path.join(eb.installdir, 'manifest.json')
+        write_file(manifest_path, json.dumps({'digest': img['manifest']}))
+        smoke_runs = []
+        eb.run_smoke_tests = lambda: smoke_runs.append(True) or []
+        eb.skip = True
+        eb.sanity_check_step()
+        self.assertEqual(smoke_runs, [])
+        self.assertEqual(json.loads(read_file(manifest_path)), {'digest': img['manifest']})
+        write_file(manifest_path, json.dumps({'digest': 'sha256:' + 'b' * 64}))
+        self.assertRaisesRegex(EasyBuildError, "built from sha256:b+ but the recipe pins", eb.sanity_check_step)
+
+    def test_containerstack_module_only_force_warns(self):
+        """--module-only --force skips the sanity check, so the manifest check too: the module step says so."""
+        EasyBlock.make_module_step = lambda self, fake=False: 'modpath'
+        eb, _ = self._cs_easyblock()
+        update_build_option('module_only', True)
+        for force, fake, warned in ((True, False, True), (False, False, False), (True, True, False)):
+            update_build_option('force', force)
+            with self.mocked_stdout_stderr() as (stdout, stderr):
+                self.assertEqual(eb.make_module_step(fake=fake), 'modpath')
+            output = stdout.getvalue() + stderr.getvalue()
+            self.assertEqual("--force skips the manifest/digest check; do not promote with --force" in output,
+                             warned, (force, fake, output))
+
+    def test_containerstack_rebuild_readonly(self):
+        """Installed files become read-only, and --rebuild can still replace the install."""
+        eb, _ = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        eb.permissions_step()
+        if os.geteuid() != 0:
+            self.assertFalse(os.access(os.path.join(eb.installdir, 'image.sif'), os.W_OK))
+        eb.make_installdir()
+        self.assertEqual(os.listdir(eb.installdir), [])
+
+    def test_containerstack_log_dir_writable(self):
+        """permissions_step leaves installdir/easybuild writable, so EasyBuild can archive the recipe on promotion."""
+        eb, _ = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        write_file(os.path.join(eb.installdir, 'manifest.json'), '{}')
+        archived = os.path.join(eb.installdir, 'easybuild', 'tiny-container-1.0.eb')
+        write_file(archived, 'hidden = True\n')
+        eb.permissions_step()
+        self.assertTrue(os.access(archived, os.W_OK))
+        if os.geteuid() != 0:
+            for rel in ('image.sif', 'manifest.json'):
+                self.assertFalse(os.access(os.path.join(eb.installdir, rel), os.W_OK), rel)
+
+    def test_containerstack_module_extra(self):
+        """The module puts bin/ on PATH and sets <PREFIX>_SQSH, <PREFIX>_SIF and <PREFIX>_DIGEST."""
+        eb, img = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        eb.make_module_step(fake=True)
+        txt = read_file(eb.module_generator.get_module_filepath(fake=True))
+        with eb.module_generator.start_module_creation():
+            self.assertIn(eb.module_generator.prepend_paths('PATH', ['bin']), txt)
+        for var, value in (('TINYCONTAINER_SQSH', os.path.join(eb.installdir, 'image.sqsh')),
+                           ('TINYCONTAINER_SIF', os.path.join(eb.installdir, 'image.sif')),
+                           ('TINYCONTAINER_DIGEST', img['manifest'])):
+            self.assertTrue(re.search(r'%s.*%s' % (var, re.escape(value)), txt), (var, txt))
+
+    def test_containerstack_module_warns_host_python(self):
+        """Loaded over a host Python module, a module with python* launchers warns (on load only) of the shadowing."""
+        warning = ("WARNING: tiny-container/1.0: the container's python, python3 now shadow the host Python "
+                   "(EBROOTPYTHON is set); host Python packages are not visible inside the container; set "
+                   "CS_PYTHONPATH to pass paths into the container")
+        expected = {
+            'Lua': 'if mode() == "load" and (os.getenv("EBROOTPYTHON") or "") ~= "" then\n'
+                   '    io.stderr:write("%s\\n")\nend\n' % warning,
+            'Tcl': 'if { [ module-info mode load ] && [ info exists ::env(EBROOTPYTHON) ] && '
+                   '$::env(EBROOTPYTHON) ne "" } {\n    puts stderr "%s"\n}\n' % warning,
+        }
+        for launchers, warns in (("{'python': 'python', 'python3': 'python3', 'greet': 'cat /etc/greeting'}", True),
+                                 ("{'greet': 'cat /etc/greeting', 'pip': 'pip'}", False)):
+            eb, _ = self._cs_easyblock(extra="launchers = %s\n" % launchers)
+            for syntax, generator in (('Lua', ModuleGeneratorLua), ('Tcl', ModuleGeneratorTcl)):
+                eb.module_generator = generator(eb, fake=True)
+                txt = eb.make_module_extra()
+                self.assertEqual(expected[syntax] in txt, warns, (syntax, launchers, txt))
+                self.assertEqual('shadow' in txt, warns, (syntax, launchers, txt))
+
+    def test_containerstack_module_warning_quoting(self):
+        """The load warning prints the module name verbatim in Tcl and Lua, whatever characters it has: unbalanced
+        braces, control characters (also before a digit) as escapes, never raw in the module file."""
+        eb, _ = self._cs_easyblock(extra="launchers = {'python': 'python'}\n")
+        names = ('odd[x] $y "q" \\z {b} ]==] [exit 3];\x01' + '7\x1b\r\t/1.0', 'x{/1.0', '}y/1.0')
+        stubs = {'Tcl': ('tclsh', 'proc module-info {what mode} { return 1 }\n'),
+                 'Lua': ('lua', 'function mode() return "load" end\n')}
+        ran = set()
+        for name in names:
+            warning = ("WARNING: %s: the container's python now shadows the host Python (EBROOTPYTHON is set); host "
+                       "Python packages are not visible inside the container; set CS_PYTHONPATH to pass paths into "
+                       "the container\n" % name)
+            for syntax, generator in (('Lua', ModuleGeneratorLua), ('Tcl', ModuleGeneratorTcl)):
+                eb.module_generator = generator(eb, fake=True)
+                with mock.patch.object(containerstack.ContainerStack, 'short_mod_name', new=name):
+                    code = eb._host_python_warning()
+                self.assertIn('shadows', code)
+                self.assertEqual([c for c in code if (ord(c) < 32 and c != '\n') or ord(c) == 127], [], syntax)
+                interpreter, stub = stubs[syntax]
+                if not shutil.which(interpreter):
+                    continue
+                # bytes, so that a carriage return is compared as it is (text mode would turn it into a newline)
+                res = subprocess.run([shutil.which(interpreter)], input=(stub + code).encode(), capture_output=True,
+                                     env={'PATH': os.environ.get('PATH', ''), 'EBROOTPYTHON': '/host/python'})
+                self.assertEqual((res.returncode, res.stdout, res.stderr.decode()), (0, b'', warning), (syntax, name))
+                ran.add(syntax)
+        if not ran:
+            self.skipTest("neither tclsh nor lua to run the module code with")
 
 
 def suite(loader):

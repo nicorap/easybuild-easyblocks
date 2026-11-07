@@ -1,0 +1,14 @@
+# enroot-provenance: docker://registry-1.docker.io#library/python:sha256:d76f585fb0d5107dd47143da5e61554fd9cae656a30f3470f815cb8475769b6a
+
+mkdir -p "/" 2> /dev/null
+cd "/" && unset OLDPWD || exit 1
+
+if [ -s /etc/rc.local ]; then
+    . /etc/rc.local
+fi
+
+if [ $# -gt 0 ]; then
+    exec  "$@"
+else
+    exec  'python3'
+fi
