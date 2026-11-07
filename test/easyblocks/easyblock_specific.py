@@ -1795,6 +1795,25 @@ class EasyBlockSpecificTest(TestCase):
         self.assertIn('cmd=()', read_file(os.path.join(eb.installdir, 'bin', '.cs-run')))
         self.assertFalse(os.path.exists(os.path.join(eb.installdir, 'manifest.json')))
 
+    def test_containerstack_sanity_check_paths(self):
+        """The sanity check requires every installed file, including the enroot hook the wrappers use with sqsh."""
+        paths = []
+        EasyBlock.sanity_check_step = lambda self, *args, **kwargs: paths.append(kwargs['custom_paths'])
+        eb, _ = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        self._cs_gpu(True)
+        eb.sanity_check_step()
+        self.assertEqual(sorted(paths[-1]['files']), ['bin/.cs-run', 'bin/greet', 'etc/enroot-no-entrypoint.conf',
+                                                      'etc/site.env', 'image.sif', 'image.sqsh'])
+        for rel in paths[-1]['files']:
+            self.assertTrue(os.path.isfile(os.path.join(eb.installdir, rel)), rel)
+        # without sqsh there is no enroot, so no hook to require
+        eb.cfg['formats'] = ['sif']
+        eb.sanity_check_step()
+        self.assertNotIn('etc/enroot-no-entrypoint.conf', paths[-1]['files'])
+
     def test_containerstack_smoke_tests(self):
         """Every smoke test runs in every format via bin/.cs-run; a missing GPU fails unless explicitly allowed."""
         eb, _ = self._cs_easyblock()
