@@ -68,6 +68,22 @@ POLICIES = ('auto', 'apptainer', 'enroot', 'pyxis')
 MANIFEST = 'manifest.json'
 # paths an Apptainer sandbox adds to the image rootfs; removed before making the enroot .sqsh
 APPTAINER_PATHS = ('.singularity.d', '.exec', '.run', '.shell', '.test', 'environment', 'singularity')
+ENROOT_RC_BODY = '''mkdir -p "%(workdir)s" 2> /dev/null
+cd "%(workdir)s" && unset OLDPWD || exit 1
+
+if [ -s /etc/rc.local ]; then
+    . /etc/rc.local
+fi
+
+if [ $# -gt 0 ]; then
+    exec %(entrypoint)s "$@"
+else
+    exec %(entrypoint)s %(cmd)s
+fi
+'''
+ENROOT_RC_LOCAL = ("# This file is sourced by /etc/rc when the container starts.\n"
+                   "# It can be used to manipulate the entrypoint or the command of the container.\n")
+ENROOT_DEFAULT_SQUASH_OPTIONS = '-comp lzo -noD -exit-on-error'
 
 
 def host_arch_key():
@@ -326,3 +342,45 @@ def write_oci_layout(layout_dir, blobs_dir, digest, media_type):
     size = os.path.getsize(blob_path(blobs_dir, digest))
     index = {'schemaVersion': 2, 'manifests': [{'mediaType': media_type, 'digest': digest, 'size': size}]}
     write_file(os.path.join(layout_dir, 'index.json'), json.dumps(index))
+
+
+def bash_quote(word):
+    """Quote word the way bash's ${var@Q} does for printable strings."""
+    return "'" + word.replace("'", "'\\''") + "'"
+
+
+def enroot_files(image_config, provenance):
+    """
+    The /etc files 'enroot import' writes for an image config (enroot 4.2.0, docker::configure),
+    so a .sqsh built from our own verified layers behaves exactly like one enroot imported itself.
+    """
+    cfg = image_config.get('config') or {}
+    fstab = ''.join('${ENROOT_ROOTFS}%s %s none x-create=dir,bind,rw,nosuid,nodev\n' % (vol, vol)
+                    for vol in sorted(cfg.get('Volumes') or {}))
+    environment = ''.join('%s\n' % var for var in cfg.get('Env') or [])
+    rc = '# enroot-provenance: %s\n' % provenance
+    for key, value in (cfg.get('Labels') or {}).items():
+        rc += '# %s %s\n' % (key, str(value).replace('\n', ' '))
+    rc += '\n'
+    entrypoint, cmd = cfg.get('Entrypoint') or [], cfg.get('Cmd') or []
+    if not entrypoint and not cmd:
+        cmd = ['/bin/sh']
+    rc += ENROOT_RC_BODY % {'workdir': cfg.get('WorkingDir') or '/',
+                            'entrypoint': ' '.join(bash_quote(w) for w in entrypoint),
+                            'cmd': ' '.join(bash_quote(w) for w in cmd)}
+    return {'etc/fstab': fstab, 'etc/environment': environment, 'etc/rc': rc, 'etc/rc.local': ENROOT_RC_LOCAL}
+
+
+def det_squash_options(configured=None):
+    """mksquashfs options: easyconfig value, $ENROOT_SQUASH_OPTIONS, the system enroot.conf, enroot's default."""
+    if configured:
+        return configured
+    if os.environ.get('ENROOT_SQUASH_OPTIONS'):
+        return os.environ['ENROOT_SQUASH_OPTIONS']
+    conf = os.path.join(os.environ.get('ENROOT_SYSCONF_PATH', '/etc/enroot'), 'enroot.conf')
+    if os.path.isfile(conf):
+        for line in read_file(conf).splitlines():
+            match = re.match(r'^\s*ENROOT_SQUASH_OPTIONS\s+(.+?)\s*$', line)
+            if match:
+                return match.group(1)
+    return ENROOT_DEFAULT_SQUASH_OPTIONS

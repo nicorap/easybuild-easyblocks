@@ -1276,6 +1276,41 @@ class EasyBlockSpecificTest(TestCase):
         self.assertTrue(os.path.isfile(os.path.join(layout, 'blobs', 'sha256', img['layer'].split(':')[1])))
         self.assertEqual(json.loads(read_file(os.path.join(layout, 'oci-layout'))), {'imageLayoutVersion': '1.0.0'})
 
+    def test_containerstack_enroot_files(self):
+        """enroot_files() reproduces enroot 4.2.0's /etc files exactly (fixtures captured from enroot import)."""
+        topdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'containerstack_enroot')
+        cases = sorted(d for d in os.listdir(topdir) if os.path.isdir(os.path.join(topdir, d)))
+        self.assertEqual(cases, ['golang', 'nginx', 'postgres', 'python'])
+        provenance = re.compile(r'^# enroot-provenance: .*\n')
+        for case in cases:
+            casedir = os.path.join(topdir, case)
+            config = json.loads(read_file(os.path.join(casedir, 'config.json')))
+            files = containerstack.enroot_files(config, 'containerstack://example.org/x@sha256:' + '0' * 64)
+            for rel in ('etc/rc', 'etc/environment', 'etc/fstab', 'etc/rc.local'):
+                expected = read_file(os.path.join(casedir, os.path.basename(rel)))
+                got = files[rel]
+                if rel == 'etc/rc':
+                    self.assertTrue(provenance.match(got), got)
+                    expected, got = provenance.sub('', expected), provenance.sub('', got)
+                self.assertEqual(got, expected, "%s: %s differs from enroot's" % (case, rel))
+        # no entrypoint and no cmd -> /bin/sh; arguments quoted like bash ${var@Q}
+        files = containerstack.enroot_files({'config': {}}, 'p')
+        self.assertIn("    exec  '/bin/sh'\n", files['etc/rc'])
+        files = containerstack.enroot_files({'config': {'Entrypoint': ['/x y', "it's"]}}, 'p')
+        self.assertIn("    exec '/x y' 'it'\\''s' \"$@\"\n", files['etc/rc'])
+        self.assertIn("    exec '/x y' 'it'\\''s' \n", files['etc/rc'])
+
+    def test_containerstack_squash_options(self):
+        """mksquashfs options: easyconfig value, then $ENROOT_SQUASH_OPTIONS, enroot.conf, enroot's default."""
+        self.assertEqual(containerstack.det_squash_options('-comp zstd'), '-comp zstd')
+        os.environ['ENROOT_SYSCONF_PATH'] = os.path.join(self.tmpdir, 'enroot')
+        self.assertEqual(containerstack.det_squash_options(), '-comp lzo -noD -exit-on-error')
+        write_file(os.path.join(self.tmpdir, 'enroot', 'enroot.conf'),
+                   "#ENROOT_SQUASH_OPTIONS -comp lzo\nENROOT_SQUASH_OPTIONS     -noI -noD -noF -no-duplicates  \n")
+        self.assertEqual(containerstack.det_squash_options(), '-noI -noD -noF -no-duplicates')
+        os.environ['ENROOT_SQUASH_OPTIONS'] = '-comp gzip'
+        self.assertEqual(containerstack.det_squash_options(), '-comp gzip')
+
 
 def suite(loader):
     """Return all easyblock-specific tests."""

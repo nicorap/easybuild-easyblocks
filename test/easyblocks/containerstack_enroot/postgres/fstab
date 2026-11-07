@@ -1,0 +1,1 @@
+${ENROOT_ROOTFS}/var/lib/postgresql/data /var/lib/postgresql/data none x-create=dir,bind,rw,nosuid,nodev
