@@ -1423,7 +1423,7 @@ class EasyBlockSpecificTest(TestCase):
         self.assertEqual(res.stdout.splitlines()[:5], ['TOOL apptainer', 'ARG exec', 'ARG ' + sif, 'ARG sh', 'ARG -c'])
 
     def test_containerstack_enroot_skips_entrypoint(self):
-        """Under enroot the wrappers run their command, not the image's entrypoint (as pyxis and Apptainer do)."""
+        """Under enroot the wrappers run their command, not the image's entrypoint (as Apptainer and pyxis' default)."""
         eb, _ = self._cs_easyblock()
         eb.fetch_step()
         eb.build_step()
