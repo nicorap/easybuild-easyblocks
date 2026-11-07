@@ -1590,6 +1590,24 @@ class EasyBlockSpecificTest(TestCase):
         self.assertTrue(any('.cs-run' in c for c in self.cs_calls))
         self.assertEqual(json.loads(read_file(manifest_path)), {'digest': img['manifest']})
 
+    def test_containerstack_skip_existing(self):
+        """eb --skip on an existing install only checks its manifest: no smoke tests, no rewrite."""
+        EasyBlock.sanity_check_step = lambda self, *args, **kwargs: None
+        eb, img = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        manifest_path = os.path.join(eb.installdir, 'manifest.json')
+        write_file(manifest_path, json.dumps({'digest': img['manifest']}))
+        smoke_runs = []
+        eb.run_smoke_tests = lambda: smoke_runs.append(True) or []
+        eb.skip = True
+        eb.sanity_check_step()
+        self.assertEqual(smoke_runs, [])
+        self.assertEqual(json.loads(read_file(manifest_path)), {'digest': img['manifest']})
+        write_file(manifest_path, json.dumps({'digest': 'sha256:' + 'b' * 64}))
+        self.assertRaisesRegex(EasyBuildError, "built from sha256:b+ but the recipe pins", eb.sanity_check_step)
+
     def test_containerstack_module_only_force_warns(self):
         """--module-only --force skips the sanity check, so the manifest check too: the module step says so."""
         EasyBlock.make_module_step = lambda self, fake=False: 'modpath'

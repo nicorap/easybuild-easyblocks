@@ -684,7 +684,7 @@ class ContainerStack(EasyBlock):
         write_file(path, json.dumps(data, indent=2, sort_keys=True) + '\n')
 
     def check_existing_manifest(self, path):
-        """For --module-only / --sanity-check-only: the install must be complete and match the pinned digest."""
+        """For --module-only / --sanity-check-only / --skip: the install must be complete and match the digest."""
         if not os.path.isfile(path):
             raise EasyBuildError("ContainerStack: %s has no manifest.json: not a complete install (rebuild it)",
                                  self.installdir)
@@ -702,7 +702,8 @@ class ContainerStack(EasyBlock):
         files += [os.path.join('bin', name) for name in sorted(self.cfg['launchers'])]
         super().sanity_check_step(custom_paths={'files': files, 'dirs': []})
         manifest_path = os.path.join(self.installdir, MANIFEST)
-        if build_option('module_only') or self.cfg['module_only'] or build_option('sanity_check_only'):
+        # --module-only, --sanity-check-only and --skip (eb.skip: already installed) never rewrite the manifest
+        if build_option('module_only') or self.cfg['module_only'] or build_option('sanity_check_only') or self.skip:
             self.check_existing_manifest(manifest_path)
             if build_option('sanity_check_only'):
                 self.run_smoke_tests()
