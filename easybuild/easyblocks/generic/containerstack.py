@@ -260,6 +260,9 @@ class RegistryClient:
 
 def blob_path(blobs_dir, digest):
     """Path of blob digest in a content-addressed store (an OCI layout's blobs/sha256 directory)."""
+    if not DIGEST_RE.match(digest or ''):
+        raise EasyBuildError("ContainerStack: invalid blob digest %r (expected sha256:<64 hex>); refusing to use it "
+                             "as a path in %s", digest, blobs_dir)
     return os.path.join(blobs_dir, digest.split(':', 1)[1])
 
 

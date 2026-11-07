@@ -1243,6 +1243,23 @@ class EasyBlockSpecificTest(TestCase):
                                img['manifest'], blobs)
         self.assertEqual(os.listdir(blobs), [img['manifest'].split(':')[1]])
 
+    def test_containerstack_bad_blob_digest(self):
+        """Digests that are not sha256:<64 hex> are refused before being used as paths in the blob store."""
+        for bad in ('sha256:/etc/x', 'sha256:../../x', 'nocolon', 'sha256:' + 'A' * 64):
+            self.assertRaisesRegex(EasyBuildError, "invalid blob digest", containerstack.blob_path, self.tmpdir, bad)
+        reg, img, client = self._cs_registry()
+        manifest = {'schemaVersion': 2, 'mediaType': CS_OCI_MANIFEST,
+                    'config': {'mediaType': 'application/vnd.oci.image.config.v1+json', 'digest': img['config'],
+                               'size': len(reg.blobs[img['config']])},
+                    'layers': [{'mediaType': 'application/vnd.oci.image.layer.v1.tar+gzip',
+                                'digest': 'sha256:../../escape', 'size': 1}]}
+        digest = reg.add_manifest(manifest, CS_OCI_MANIFEST)
+        blobs = os.path.join(self.tmpdir, 'store', 'blobs')
+        self.assertRaisesRegex(EasyBuildError, "invalid blob digest", containerstack.fetch_oci_blobs, client,
+                               digest, blobs)
+        escaped = [f for _, _, files in os.walk(self.tmpdir) for f in files if f in ('escape', 'escape.part')]
+        self.assertEqual(escaped, [])
+
     def test_containerstack_oci_layout(self):
         """write_oci_layout() makes an OCI layout whose blobs are the shared store; rewriting is idempotent."""
         _, img, client = self._cs_registry()
