@@ -534,44 +534,66 @@ def layer_path(name):
     return os.path.normpath('/' + name).lstrip('/')
 
 
-def hard_link_data(blobs_dir, layer, links):
+def hard_link_error(layer, path, link):
+    """The error for a hard link that does not resolve to a file before it in its layer."""
+    return EasyBuildError("ContainerStack: hard link %s in layer %s links to %s, which is not a file before it in "
+                          "that layer", path, layer['digest'], layer_path(link.linkname))
+
+
+def hard_link_data(blobs_dir, layer, links, index):
     """
-    {path: data} for the hard links 'links' ({path: TarInfo}) of a layer: the data of the member each links to, the
-    last one of that name before the link (as tarfile resolves it). Read in a second pass over the layer, keeping only
-    those members, because a zstd layer streamed through the 'zstd' command cannot seek back to them.
+    {path: data} for the hard links 'links' ({path: TarInfo}) of a layer streamed through the 'zstd' command, which
+    cannot seek back to the member a link names. index ({name: [(offset, hard link target or None, is a file)]},
+    every member of the layer in order) resolves each link as tarfile does: to the last member of that name before
+    it, following a hard link to a hard link (each step goes to an earlier member, so this ends). The data is read
+    in a second pass over the layer, keeping only those members.
     """
+    targets = {}
+    for path, link in links.items():
+        name, before = layer_path(link.linkname), link.offset
+        while True:
+            earlier = [entry for entry in index.get(name, []) if entry[0] < before]
+            if not earlier:
+                raise hard_link_error(layer, path, link)
+            before, linkname, isfile = earlier[-1]
+            if linkname is None:
+                if not isfile:
+                    raise hard_link_error(layer, path, link)
+                targets.setdefault(before, []).append(path)
+                break
+            name = layer_path(linkname)
     data = {}
     with open_layer(blobs_dir, layer) as tar:
         for member in tar:
-            name = layer_path(member.name)
-            wanted = [path for path, link in links.items()
-                      if member.offset < link.offset and layer_path(link.linkname) == name]
-            for path in wanted:
-                data.pop(path, None)
-            if wanted and member.isfile():
+            if member.offset in targets:
                 content = tar.extractfile(member).read()
-                data.update((path, content) for path in wanted)
-    for path, link in links.items():
-        if path not in data:
-            raise EasyBuildError("ContainerStack: hard link %s in layer %s links to %s, which is not a file "
-                                 "before it in that layer", path, layer['digest'], layer_path(link.linkname))
+                data.update((path, content) for path in targets[member.offset])
     return data
+
+
+def layer_is_streamed(layer):
+    """Whether open_layer() streams this layer through the 'zstd' command (so its TarFile cannot seek)."""
+    return layer.get('mediaType') == OCI_LAYER_ZSTD and not tarfile_reads_zstd()
 
 
 def image_entries(blobs_dir, layers, paths):
     """
     For each image path in 'paths': (TarInfo, bytes or None) of its final entry once all layers are applied
     in order (OCI whiteouts and opaque directories included), or None if the image does not have it.
-    A hard link's bytes are those of the member it links to.
+    A hard link's bytes are those of the member it links to (through any chain of hard links), as tarfile reads them.
     """
     found = dict((path, None) for path in paths)
     for layer in layers:
+        streamed = layer_is_streamed(layer)
         # gone: (path, whether the path itself goes too) for what this layer hides of the lower layers
-        # links: the hard links among this layer's entries, whose data comes from a second pass
-        entries, gone, links = {}, [], {}
+        # links, index: for a streamed layer, the wanted hard links and every member, for a second pass
+        entries, gone, links, index = {}, [], {}, {}
         with open_layer(blobs_dir, layer) as tar:
             for member in tar:
                 name = layer_path(member.name)
+                if streamed:
+                    index.setdefault(name, []).append(
+                        (member.offset, member.linkname if member.islnk() else None, member.isfile()))
                 parent, base = os.path.split(name)
                 if base == '.wh..wh..opq':
                     gone.append((parent, False))
@@ -582,12 +604,22 @@ def image_entries(blobs_dir, layers, paths):
                         gone.append((name, False))
                     if name in found:
                         links.pop(name, None)
-                        if member.islnk():
+                        data = None
+                        if member.isfile():
+                            data = tar.extractfile(member).read()
+                        elif member.islnk() and streamed:
                             links[name] = member
-                        data = tar.extractfile(member).read() if member.isfile() else None
+                        elif member.islnk():    # tarfile seeks back to the member it links to
+                            try:
+                                fh = tar.extractfile(member)
+                            except KeyError:    # no member of that name before it
+                                fh = None
+                            if fh is None:    # or not a file
+                                raise hard_link_error(layer, name, member)
+                            data = fh.read()
                         entries[name] = (member, data)
         if links:
-            for path, data in hard_link_data(blobs_dir, layer, links).items():
+            for path, data in hard_link_data(blobs_dir, layer, links, index).items():
                 entries[path] = (entries[path][0], data)
         for path in found:
             if any(not g or path.startswith(g + '/') or (itself and path == g) for g, itself in gone):

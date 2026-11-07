@@ -1963,6 +1963,36 @@ class EasyBlockSpecificTest(TestCase):
         self.assertRaisesRegex(EasyBuildError, "hard link etc/hosts .* links to etc/nowhere",
                                containerstack.image_entries, blobs, [dangling], paths)
 
+    def test_containerstack_hard_link_chain(self):
+        """Hard links to hard links resolve as tarfile does, in gzip and zstd layers; a gzip layer is read once."""
+        blobs = os.path.join(self.tmpdir, 'blobs')
+
+        def members():
+            return [_cs_member('etc/a', b'first a\n'), _cs_member('etc/b', kind=tarfile.LNKTYPE, linkname='etc/a'),
+                    _cs_member('etc/a', b'a after b\n'),
+                    _cs_member('etc/hosts', kind=tarfile.LNKTYPE, mode=0o640, linkname='./etc/b'),
+                    _cs_member('etc/resolv.conf', kind=tarfile.LNKTYPE, linkname='etc/hosts')]
+        paths = ('etc/hosts', 'etc/resolv.conf')
+        dangling = [_cs_member('etc/b', kind=tarfile.LNKTYPE, linkname='etc/nowhere'),
+                    _cs_member('etc/hosts', kind=tarfile.LNKTYPE, linkname='etc/b')]
+        kinds = [False] + (['native', 'command'] if shutil.which('zstd') else [])
+        for zstd in kinds:
+            if zstd == 'command':
+                self._cs_without_zstd_tarfile()
+            elif zstd == 'native' and not containerstack.tarfile_reads_zstd():
+                continue
+            layer = _cs_layer(blobs, members(), zstd=bool(zstd))
+            orig_open_layer = containerstack.open_layer
+            with mock.patch.object(containerstack, 'open_layer', side_effect=orig_open_layer) as opened:
+                found = containerstack.image_entries(blobs, [layer], paths)
+            # what tarfile itself reads for them: etc/b links to the etc/a before it
+            self.assertEqual([found[p][1] for p in paths], [b'first a\n', b'first a\n'], zstd)
+            self.assertEqual(found['etc/hosts'][0].mode, 0o640)
+            self.assertEqual(opened.call_count, 2 if zstd == 'command' else 1, zstd)
+            self.assertRaisesRegex(EasyBuildError, "hard link etc/hosts .* links to etc/b, which is not a file",
+                                   containerstack.image_entries, blobs, [_cs_layer(blobs, dangling, zstd=bool(zstd))],
+                                   paths)
+
     def test_containerstack_fixperms(self):
         """enroot's fixperms: chmod -R u+rX, then u+w on directories as deep as enroot's find reaches them."""
         root = os.path.join(self.tmpdir, 'rootfs')
