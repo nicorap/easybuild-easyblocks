@@ -1577,6 +1577,15 @@ class EasyBlockSpecificTest(TestCase):
         results = eb.run_smoke_tests()
         self.assertEqual(sorted({r['result'] for r in results if r['kind'] == 'gpu'}), ['not-run: no GPU'])
 
+    def test_containerstack_smoke_failure_removes_enroot_container(self):
+        """A failing enroot smoke test still removes the unpacked enroot container."""
+        eb, _ = self._cs_easyblock()
+        eb.fetch_step()
+        self._cs_gpu(True)
+        self.cs_fail = {'test -f /etc/greeting': 1}
+        self.assertRaisesRegex(EasyBuildError, "cpu smoke test failed in sqsh", eb.run_smoke_tests)
+        self.assertTrue(re.search(r'ENROOT_DATA_PATH=\S+ enroot remove -f', self.cs_calls[-1]), self.cs_calls[-1])
+
     def test_containerstack_require_gpu_without_gpu_tests(self):
         """require_gpu_tests = True with no 'gpu' smoke test is a recipe error, with or without a GPU."""
         eb, _ = self._cs_easyblock("require_gpu_tests = True\nsmoke_tests = [('cpu', 'true')]\n")

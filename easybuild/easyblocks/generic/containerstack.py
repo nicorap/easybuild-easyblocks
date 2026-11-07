@@ -657,23 +657,25 @@ class ContainerStack(EasyBlock):
                                  "or set require_gpu_tests = False", gpu_tests[0], socket.gethostname())
         results = []
         for fmt in self.cfg['formats']:
-            for kind, command in tests:
-                result = {'format': fmt, 'kind': kind, 'command': command,
-                          'date': time.strftime('%Y-%m-%dT%H:%M:%S')}
-                if kind == 'gpu' and not gpu:
-                    result['result'] = 'not-run: no GPU'
-                else:
-                    start = time.time()
-                    res = run_shell_cmd(self._smoke_cmd(fmt, command), fail_on_error=False)
-                    if res.exit_code != 0:
-                        raise EasyBuildError("ContainerStack: %s smoke test failed in %s (exit %s): %s\n%s",
-                                             kind, fmt, res.exit_code, command, (res.output or '')[-2000:])
-                    result.update(result='pass', seconds=round(time.time() - start, 1))
-                results.append(result)
-            if fmt == 'sqsh':
-                data = shlex.quote(os.path.join(self.builddir, 'enroot-data'))
-                run_shell_cmd('ENROOT_DATA_PATH=%s enroot remove -f $(ENROOT_DATA_PATH=%s enroot list) || true'
-                              % (data, data), fail_on_error=False)
+            try:
+                for kind, command in tests:
+                    result = {'format': fmt, 'kind': kind, 'command': command,
+                              'date': time.strftime('%Y-%m-%dT%H:%M:%S')}
+                    if kind == 'gpu' and not gpu:
+                        result['result'] = 'not-run: no GPU'
+                    else:
+                        start = time.time()
+                        res = run_shell_cmd(self._smoke_cmd(fmt, command), fail_on_error=False)
+                        if res.exit_code != 0:
+                            raise EasyBuildError("ContainerStack: %s smoke test failed in %s (exit %s): %s\n%s",
+                                                 kind, fmt, res.exit_code, command, (res.output or '')[-2000:])
+                        result.update(result='pass', seconds=round(time.time() - start, 1))
+                    results.append(result)
+            finally:
+                if fmt == 'sqsh':    # remove the unpacked enroot container, even after a failed test
+                    data = shlex.quote(os.path.join(self.builddir, 'enroot-data'))
+                    run_shell_cmd('ENROOT_DATA_PATH=%s enroot remove -f $(ENROOT_DATA_PATH=%s enroot list) || true'
+                                  % (data, data), fail_on_error=False)
         return results
 
     def runtime_versions(self):
