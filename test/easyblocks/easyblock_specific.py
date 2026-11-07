@@ -71,6 +71,113 @@ from easybuild.tools.run import RunShellCmdResult
 from easybuild.tools.toolchain.toolchain import RPATH_WRAPPERS_SUBDIR
 
 
+CS_OCI_INDEX = 'application/vnd.oci.image.index.v1+json'
+CS_OCI_MANIFEST = 'application/vnd.oci.image.manifest.v1+json'
+
+
+class _CSFakeRegistry:
+    """Minimal OCI distribution API on 127.0.0.1 (bearer token, manifests, blobs) for ContainerStack tests."""
+
+    def __init__(self, repo='team/tiny'):
+        self.repo = repo
+        self.manifests = {}
+        self.blobs = {}
+        self.requests = []
+        self.token_auth = []
+        self.tamper_manifest = False
+        self.tamper_blobs = False
+        registry = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _send(self, code, body, ctype):
+                self.send_response(code)
+                self.send_header('Content-Type', ctype)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                registry.requests.append(self.path)
+                if self.path.startswith('/token'):
+                    registry.token_auth.append(self.headers.get('Authorization'))
+                    return self._send(200, b'{"token": "T0K"}', 'application/json')
+                if self.headers.get('Authorization') != 'Bearer T0K':
+                    challenge = 'Bearer realm="http://127.0.0.1:%d/token",service="fake",scope="repository:%s:pull"'
+                    self.send_response(401)
+                    self.send_header('WWW-Authenticate', challenge % (registry.port, registry.repo))
+                    self.send_header('Content-Length', '0')
+                    self.end_headers()
+                    return None
+                prefix = '/v2/%s/' % registry.repo
+                kind, ref = '', ''
+                if self.path.startswith(prefix):
+                    kind, _, ref = self.path[len(prefix):].partition('/')
+                if kind == 'manifests' and ref in registry.manifests:
+                    data, ctype = registry.manifests[ref]
+                    return self._send(200, data + (b' ' if registry.tamper_manifest else b''), ctype)
+                if kind == 'blobs' and ref in registry.blobs:
+                    data = registry.blobs[ref] + (b'x' if registry.tamper_blobs else b'')
+                    return self._send(200, data, 'application/octet-stream')
+                return self._send(404, b'{}', 'application/json')
+
+        self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self.port = self.server.server_address[1]
+        self.address = '127.0.0.1:%d' % self.port
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def add_blob(self, data):
+        digest = 'sha256:' + hashlib.sha256(data).hexdigest()
+        self.blobs[digest] = data
+        return digest
+
+    def add_manifest(self, doc, ctype, tag=None):
+        data = json.dumps(doc).encode()
+        digest = 'sha256:' + hashlib.sha256(data).hexdigest()
+        self.manifests[digest] = (data, ctype)
+        if tag:
+            self.manifests[tag] = (data, ctype)
+        return digest
+
+    def blob_requests(self):
+        return [r for r in self.requests if '/blobs/' in r]
+
+
+def _cs_tiny_image(registry, tag='1.0'):
+    """Push a one-layer image (file etc/greeting) and a multi-arch index to the fake registry; return digests."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w:gz') as tar:
+        data = b'hello\n'
+        info = tarfile.TarInfo('etc/greeting')
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    layer = buf.getvalue()
+    config = json.dumps({'architecture': 'amd64', 'os': 'linux', 'rootfs': {'type': 'layers', 'diff_ids': []},
+                         'config': {'Env': ['PATH=/usr/bin:/bin', 'GREETING=hello world'], 'Cmd': ['sh'],
+                                    'WorkingDir': '/work'}}).encode()
+    layer_digest = registry.add_blob(layer)
+    config_digest = registry.add_blob(config)
+    manifest = {'schemaVersion': 2, 'mediaType': CS_OCI_MANIFEST,
+                'config': {'mediaType': 'application/vnd.oci.image.config.v1+json', 'digest': config_digest,
+                           'size': len(config)},
+                'layers': [{'mediaType': 'application/vnd.oci.image.layer.v1.tar+gzip', 'digest': layer_digest,
+                            'size': len(layer)}]}
+    manifest_digest = registry.add_manifest(manifest, CS_OCI_MANIFEST)
+    index = {'schemaVersion': 2, 'mediaType': CS_OCI_INDEX, 'manifests': [
+        {'mediaType': CS_OCI_MANIFEST, 'digest': manifest_digest, 'size': len(json.dumps(manifest)),
+         'platform': {'os': 'linux', 'architecture': 'amd64'}},
+        {'mediaType': CS_OCI_MANIFEST, 'digest': 'sha256:' + 'f' * 64, 'size': 1,
+         'platform': {'os': 'unknown', 'architecture': 'unknown'}}]}
+    index_digest = registry.add_manifest(index, CS_OCI_INDEX, tag=tag)
+    return {'manifest': manifest_digest, 'index': index_digest, 'config': config_digest, 'layer': layer_digest}
+
+
 class EasyBlockSpecificTest(TestCase):
     """ Baseclass for easyblock testcases """
 
@@ -93,9 +200,25 @@ class EasyBlockSpecificTest(TestCase):
 
         self.orig_environ = copy.deepcopy(os.environ)
         self.orig_pythonpackage_run_shell_cmd = pythonpackage.run_shell_cmd
+        self.cs_orig = (containerstack.run_shell_cmd, containerstack.source_paths, containerstack.host_arch_key,
+                        containerstack.disk_free, EasyBlock.sanity_check_step)
+        self.cs_orig_opts = {opt: build_option(opt) for opt in ('module_only', 'sanity_check_only')}
+        self.cs_fail = {}
+        self.cs_calls = []
+        self.cs_squashed = {}
+        os.environ['DOCKER_CONFIG'] = os.path.join(self.tmpdir, 'docker')
+        for var in ('CONTAINERSTACK_REGISTRY_USER', 'CONTAINERSTACK_REGISTRY_PASSWORD', 'CS_GPU_DEVICE',
+                    'ENROOT_SQUASH_OPTIONS', 'ENROOT_SYSCONF_PATH'):
+            os.environ.pop(var, None)
 
     def tearDown(self):
         """Test cleanup."""
+        (containerstack.run_shell_cmd, containerstack.source_paths, containerstack.host_arch_key,
+         containerstack.disk_free, EasyBlock.sanity_check_step) = self.cs_orig
+        for opt, value in self.cs_orig_opts.items():
+            update_build_option(opt, value)
+        if os.path.isdir(self.tmpdir):
+            adjust_permissions(self.tmpdir, stat.S_IWUSR, add=True, recursive=True)
         remove_dir(self.tmpdir)
 
         pythonpackage.run_shell_cmd = self.orig_pythonpackage_run_shell_cmd
@@ -966,6 +1089,63 @@ class EasyBlockSpecificTest(TestCase):
             self.assertRaisesRegex(EasyBuildError, "must not contain a tag or digest", split, bad)
         self.assertEqual(containerstack.env_var_prefix('PyTorch-container'), 'PYTORCHCONTAINER')
         self.assertEqual(containerstack.env_var_prefix('vLLM-container'), 'VLLMCONTAINER')
+
+    def _cs_registry(self):
+        """Fake registry with the tiny image, and a client for it."""
+        reg = _CSFakeRegistry()
+        self.addCleanup(reg.close)
+        img = _cs_tiny_image(reg)
+        return reg, img, containerstack.RegistryClient(reg.address, reg.repo, scheme='http')
+
+    def test_containerstack_registry_token_flow(self):
+        """Anonymous bearer-token flow: 401 challenge, token request, manifest by digest; the token is reused."""
+        reg, img, client = self._cs_registry()
+        data, media_type = client.fetch_manifest(img['manifest'])
+        self.assertEqual(media_type, CS_OCI_MANIFEST)
+        self.assertEqual(json.loads(data)['layers'][0]['digest'], img['layer'])
+        client.fetch_manifest(img['manifest'])
+        self.assertEqual(len([r for r in reg.requests if r.startswith('/token')]), 1)
+        self.assertEqual(reg.token_auth, [None])
+
+    def test_containerstack_registry_rejects_index(self):
+        """Pinning the multi-arch index digest instead of a per-arch manifest digest fails with advice."""
+        _, img, client = self._cs_registry()
+        self.assertRaisesRegex(EasyBuildError, "is a multi-arch index, not a per-architecture manifest",
+                               client.fetch_manifest, img['index'])
+
+    def test_containerstack_registry_rejects_wrong_manifest(self):
+        """A registry that returns different bytes than the requested digest is refused."""
+        reg, img, client = self._cs_registry()
+        reg.tamper_manifest = True
+        self.assertRaisesRegex(EasyBuildError, "not the requested %s" % img['manifest'],
+                               client.fetch_manifest, img['manifest'])
+
+    def test_containerstack_registry_errors(self):
+        """HTTP errors and unreachable registries produce messages naming the URL or host."""
+        _, _, client = self._cs_registry()
+        self.assertRaisesRegex(EasyBuildError, "returned HTTP 404", client.fetch_manifest, 'sha256:' + '0' * 64)
+        dead = containerstack.RegistryClient('127.0.0.1:9', 'x/y', scheme='http', timeout=5)
+        self.assertRaisesRegex(EasyBuildError, "cannot reach", dead.fetch_manifest, 'sha256:' + '0' * 64)
+
+    def test_containerstack_registry_credentials(self):
+        """Credentials come from the environment or $DOCKER_CONFIG/config.json, never from the easyconfig."""
+        reg, img, _ = self._cs_registry()
+        self.assertEqual(containerstack.registry_credentials(reg.address), None)
+        auth = base64.b64encode(b'alice:s3cret').decode()
+        write_file(os.path.join(self.tmpdir, 'docker', 'config.json'),
+                   json.dumps({'auths': {reg.address: {'auth': auth}}}))
+        self.assertEqual(containerstack.registry_credentials(reg.address), ('alice', 's3cret'))
+        os.environ['CONTAINERSTACK_REGISTRY_USER'] = 'bob'
+        os.environ['CONTAINERSTACK_REGISTRY_PASSWORD'] = 'pw'
+        client = containerstack.RegistryClient(reg.address, reg.repo, scheme='http')
+        client.fetch_manifest(img['manifest'])
+        self.assertEqual(reg.token_auth, ['Basic ' + base64.b64encode(b'bob:pw').decode()])
+
+    def test_containerstack_platform_digests(self):
+        """platform_digests() maps a tag's index to per-arch manifest digests (linux only)."""
+        _, img, client = self._cs_registry()
+        self.assertEqual(client.platform_digests('1.0'), {'x86_64': img['manifest']})
+        self.assertRaisesRegex(EasyBuildError, "single-architecture image", client.platform_digests, img['manifest'])
 
 
 def suite(loader):

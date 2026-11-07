@@ -110,3 +110,139 @@ def split_image(image):
 def env_var_prefix(name):
     """Prefix of the module's environment variables: name upper-cased, non-alphanumerics removed."""
     return re.sub(r'[^A-Z0-9]', '', name.upper())
+
+
+def sha256_digest(data):
+    """OCI digest of a bytes object."""
+    return 'sha256:' + hashlib.sha256(data).hexdigest()
+
+
+def file_sha256(path):
+    """OCI digest of a file, read in chunks."""
+    sha = hashlib.sha256()
+    with open(path, 'rb') as fh:
+        for chunk in iter(lambda: fh.read(CHUNK), b''):
+            sha.update(chunk)
+    return 'sha256:' + sha.hexdigest()
+
+
+def disk_free(path):
+    """Free bytes on the filesystem holding path."""
+    return shutil.disk_usage(path).free
+
+
+def registry_credentials(registry):
+    """(user, password) for registry from $CONTAINERSTACK_REGISTRY_USER/_PASSWORD or Docker's config.json."""
+    user, password = os.environ.get('CONTAINERSTACK_REGISTRY_USER'), os.environ.get('CONTAINERSTACK_REGISTRY_PASSWORD')
+    if user and password:
+        return user, password
+    cfg = os.path.join(os.environ.get('DOCKER_CONFIG', os.path.expanduser('~/.docker')), 'config.json')
+    if not os.path.isfile(cfg):
+        return None
+    try:
+        auths = json.loads(read_file(cfg)).get('auths', {})
+    except ValueError as err:
+        raise EasyBuildError("ContainerStack: cannot parse %s: %s", cfg, err)
+    keys = [registry, 'https://' + registry]
+    if registry == DOCKER_HUB:
+        keys += ['https://index.docker.io/v1/', 'docker.io']
+    for key in keys:
+        auth = auths.get(key, {}).get('auth')
+        if auth:
+            user, _, password = base64.b64decode(auth).decode().partition(':')
+            return user, password
+    return None
+
+
+class RegistryClient:
+    """Read-only client for the OCI distribution API: manifests and blobs by digest, bearer-token auth."""
+
+    def __init__(self, registry, repo, scheme='https', timeout=300):
+        self.registry = registry
+        self.repo = repo
+        self.base = '%s://%s/v2/%s' % (scheme, registry, repo)
+        self.timeout = timeout
+        self.token = None
+        self.creds = registry_credentials(registry)
+
+    def _open(self, url, accept):
+        """GET url, answering one bearer-token challenge; returns the HTTP response."""
+        for attempt in range(2):
+            headers = {'Accept': accept}
+            if self.token:
+                headers['Authorization'] = 'Bearer ' + self.token
+            try:
+                return urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=self.timeout)
+            except urllib.error.HTTPError as err:
+                if err.code == 401 and self.token is None and attempt == 0:
+                    self._authenticate(err.headers.get('WWW-Authenticate', ''))
+                    continue
+                raise EasyBuildError("ContainerStack: %s returned HTTP %s", url, err.code)
+            except (urllib.error.URLError, OSError) as err:
+                raise EasyBuildError("ContainerStack: cannot reach %s: %s", url, getattr(err, 'reason', err))
+        raise EasyBuildError("ContainerStack: %s still unauthorized after authenticating", url)
+
+    def _authenticate(self, challenge):
+        """Get a pull token from the realm named in a 'WWW-Authenticate: Bearer ...' challenge."""
+        scheme, _, params = challenge.partition(' ')
+        fields = dict(re.findall(r'(\w+)="([^"]*)"', params))
+        if scheme.lower() != 'bearer' or 'realm' not in fields:
+            raise EasyBuildError("ContainerStack: unsupported auth challenge from %s: %r", self.registry, challenge)
+        query = urllib.parse.urlencode({'service': fields.get('service', ''),
+                                        'scope': fields.get('scope', 'repository:%s:pull' % self.repo)})
+        req = urllib.request.Request(fields['realm'] + '?' + query)
+        if self.creds:
+            basic = base64.b64encode(('%s:%s' % self.creds).encode()).decode()
+            req.add_header('Authorization', 'Basic ' + basic)
+        try:
+            reply = json.loads(urllib.request.urlopen(req, timeout=60).read().decode())
+        except (urllib.error.URLError, OSError, ValueError) as err:
+            raise EasyBuildError("ContainerStack: token request to %s failed: %s", fields['realm'], err)
+        self.token = reply.get('token') or reply.get('access_token')
+        if not self.token:
+            raise EasyBuildError("ContainerStack: %s returned no token", fields['realm'])
+
+    def fetch_manifest(self, digest):
+        """Fetch a per-architecture manifest by digest; returns (bytes, media_type) after checking its sha256."""
+        resp = self._open('%s/manifests/%s' % (self.base, digest), ACCEPT)
+        data = resp.read()
+        if sha256_digest(data) != digest:
+            raise EasyBuildError("ContainerStack: registry returned a manifest with sha256 %s, not the requested %s",
+                                 sha256_digest(data), digest)
+        doc = json.loads(data.decode())
+        media_type = doc.get('mediaType') or resp.headers.get('Content-Type', '').split(';')[0].strip()
+        if media_type in INDEX_TYPES or 'manifests' in doc:
+            raise EasyBuildError("ContainerStack: %s is a multi-arch index, not a per-architecture manifest; "
+                                 "pin the per-architecture digests (RegistryClient.platform_digests)", digest)
+        return data, media_type
+
+    def fetch_blob(self, digest, dest):
+        """Stream blob digest to dest via dest.part, checking its sha256; nothing is left behind on mismatch."""
+        resp = self._open('%s/blobs/%s' % (self.base, digest), '*/*')
+        part = dest + '.part'
+        sha = hashlib.sha256()
+        with open(part, 'wb') as fh:
+            for chunk in iter(lambda: resp.read(CHUNK), b''):
+                sha.update(chunk)
+                fh.write(chunk)
+        got = 'sha256:' + sha.hexdigest()
+        if got != digest:
+            os.remove(part)
+            raise EasyBuildError("ContainerStack: blob %s downloaded with sha256 %s; refusing it", digest, got)
+        os.rename(part, dest)
+
+    def platform_digests(self, ref):
+        """Per-architecture manifest digests ({'x86_64': ..., 'aarch64': ...}) of the multi-arch index ref."""
+        resp = self._open('%s/manifests/%s' % (self.base, ref), ACCEPT)
+        data = resp.read()
+        doc = json.loads(data.decode())
+        if 'manifests' not in doc:
+            raise EasyBuildError("ContainerStack: %s is a single-architecture image (digest %s); "
+                                 "pin that digest under its architecture", ref, sha256_digest(data))
+        digests = {}
+        for entry in doc['manifests']:
+            platform = entry.get('platform', {})
+            for key, goarch in GOARCH.items():
+                if platform.get('os') == 'linux' and platform.get('architecture') == goarch:
+                    digests.setdefault(key, entry['digest'])
+        return digests
