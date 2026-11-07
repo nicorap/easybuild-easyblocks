@@ -37,6 +37,7 @@ import shlex
 import shutil
 import socket
 import stat
+import tarfile
 import time
 import urllib.error
 import urllib.parse
@@ -69,6 +70,8 @@ MANIFEST = 'manifest.json'
 SMOKE_DIR = 'smoke'
 # paths an Apptainer sandbox adds to the image rootfs; removed before making the enroot .sqsh
 APPTAINER_PATHS = ('.singularity.d', '.exec', '.run', '.shell', '.test', 'environment', 'singularity')
+# bind targets an Apptainer sandbox build empties or creates; put back exactly as the image layers have them
+APPTAINER_BIND_TARGETS = ('etc/hosts', 'etc/resolv.conf')
 ENROOT_RC_BODY = '''mkdir -p "%(workdir)s" 2> /dev/null
 cd "%(workdir)s" && unset OLDPWD || exit 1
 
@@ -372,6 +375,32 @@ def enroot_files(image_config, provenance):
     return {'etc/fstab': fstab, 'etc/environment': environment, 'etc/rc': rc, 'etc/rc.local': ENROOT_RC_LOCAL}
 
 
+def image_entries(blobs_dir, layers, paths):
+    """
+    For each image path in 'paths': (TarInfo, bytes or None) of its final entry once all layers are applied
+    in order (OCI whiteouts and opaque directories included), or None if the image does not have it.
+    """
+    found = dict((path, None) for path in paths)
+    for layer in layers:
+        entries, gone = {}, []
+        with tarfile.open(blob_path(blobs_dir, layer['digest']), 'r:*') as tar:
+            for member in tar:
+                name = os.path.normpath('/' + member.name).lstrip('/')
+                parent, base = os.path.split(name)
+                if base == '.wh..wh..opq':
+                    gone.append(parent + '/')
+                elif base.startswith('.wh.'):
+                    gone.append(os.path.join(parent, base[4:]))
+                elif name in found:
+                    data = tar.extractfile(member).read() if member.isfile() or member.islnk() else None
+                    entries[name] = (member, data)
+        for path in found:
+            if any(path == g or path.startswith(g.rstrip('/') + '/') for g in gone):
+                found[path] = None
+        found.update(entries)
+    return found
+
+
 def rootfs_path(rootfs, path):
     """
     Host path of image path 'path' in rootfs. Refuses a path whose parent directory resolves outside rootfs:
@@ -604,6 +633,22 @@ class ContainerStack(EasyBlock):
         run_shell_cmd(env + 'apptainer build --force --sandbox %s oci:%s' % (shlex.quote(rootfs), shlex.quote(layout)))
         for rel in APPTAINER_PATHS:
             remove_nofollow(os.path.join(rootfs, rel))
+        # as 'enroot import' has them: the image's own bind-target files, user-writable directories, a 0755 root
+        for rel, entry in image_entries(self.blobs_dir, self.manifest['layers'], APPTAINER_BIND_TARGETS).items():
+            path = rootfs_path(rootfs, rel)
+            remove_nofollow(path)
+            if entry and entry[0].issym():
+                os.symlink(entry[0].linkname, path)
+            elif entry and entry[1] is not None:
+                with open(path, 'wb') as fh:
+                    fh.write(entry[1])
+                os.chmod(path, entry[0].mode & 0o7777)
+        for top, dirs, _ in os.walk(rootfs):
+            for sub in dirs:
+                mode = os.lstat(os.path.join(top, sub)).st_mode
+                if stat.S_ISDIR(mode) and not mode & stat.S_IWUSR:
+                    os.chmod(os.path.join(top, sub), stat.S_IMODE(mode) | stat.S_IWUSR)
+        os.chmod(rootfs, 0o755)
         with open(blob_path(self.blobs_dir, self.manifest['config']['digest']), 'rb') as fh:
             config = json.loads(fh.read().decode())
         provenance = 'containerstack://%s@%s' % (self.cfg['image'], self.digest)

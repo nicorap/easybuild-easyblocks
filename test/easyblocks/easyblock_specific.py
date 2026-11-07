@@ -169,10 +169,13 @@ def _cs_tiny_image(registry, tag='1.0', workdir='/work'):
     """Push a one-layer image (file etc/greeting) and a multi-arch index to the fake registry; return digests."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode='w:gz') as tar:
-        data = b'hello\n'
-        info = tarfile.TarInfo('etc/greeting')
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
+        for name, data in (('etc/greeting', b'hello\n'), ('./etc/hosts', b'127.0.0.1 localhost\n')):
+            info = tarfile.TarInfo(name)
+            info.size, info.mode = len(data), 0o640
+            tar.addfile(info, io.BytesIO(data))
+        info = tarfile.TarInfo('var/empty')
+        info.type, info.mode = tarfile.DIRTYPE, 0o555
+        tar.addfile(info)
     layer = buf.getvalue()
     config = json.dumps({'architecture': 'amd64', 'os': 'linux', 'rootfs': {'type': 'layers', 'diff_ids': []},
                          'config': {'Env': ['PATH=/usr/bin:/bin', 'GREETING=hello world'], 'Cmd': ['sh'],
@@ -1402,11 +1405,20 @@ class EasyBlockSpecificTest(TestCase):
                 write_file(os.path.join(rootfs, name), '')
             os.symlink('.singularity.d/env', os.path.join(rootfs, 'environment'))
             os.symlink('.singularity.d', os.path.join(rootfs, 'singularity'))
+            for name in ('etc/hosts', 'etc/resolv.conf'):    # Apptainer's empty bind targets
+                write_file(os.path.join(rootfs, name), '')
+            mkdir(os.path.join(rootfs, 'var', 'empty'), parents=True)
+            os.chmod(os.path.join(rootfs, 'var', 'empty'), 0o555)
+            os.chmod(rootfs, 0o2750)
         elif image:
             write_file(image.group(1), 'sif image')
         elif squash:
             rootfs = squash.group(1)
             self.cs_squashed = {'top': sorted(os.listdir(rootfs)),
+                                'modes': dict((rel, stat.S_IMODE(os.lstat(os.path.join(rootfs, rel)).st_mode))
+                                              for rel in ('', 'var/empty', 'etc/hosts')),
+                                'hosts': read_file(os.path.join(rootfs, 'etc', 'hosts')),
+                                'resolv': os.path.lexists(os.path.join(rootfs, 'etc', 'resolv.conf')),
                                 'rc': read_file(os.path.join(rootfs, 'etc', 'rc')),
                                 'environment': read_file(os.path.join(rootfs, 'etc', 'environment'))}
             write_file(squash.group(2), 'sqsh image')
@@ -1479,7 +1491,12 @@ class EasyBlockSpecificTest(TestCase):
         squash = [c for c in self.cs_calls if c.startswith('mksquashfs ')]
         self.assertEqual(squash, ['mksquashfs %s %s/image.sqsh -noappend -all-root -no-progress -noI -noD'
                                   % (rootfs, eb.builddir)])
-        self.assertEqual(self.cs_squashed['top'], ['etc', 'usr', 'work'])
+        self.assertEqual(self.cs_squashed['top'], ['etc', 'usr', 'var', 'work'])
+        # as 'enroot import' makes it: the image's /etc/hosts (not Apptainer's empty one), no /etc/resolv.conf
+        # the image lacks, user-writable directories and a 0755 root
+        self.assertEqual(self.cs_squashed['hosts'], '127.0.0.1 localhost\n')
+        self.assertFalse(self.cs_squashed['resolv'])
+        self.assertEqual(self.cs_squashed['modes'], {'': 0o755, 'var/empty': 0o755, 'etc/hosts': 0o640})
         self.assertTrue(self.cs_squashed['rc'].startswith('# enroot-provenance: containerstack://%s@%s\n'
                                                           % (eb.cfg['image'], img['manifest'])))
         self.assertEqual(self.cs_squashed['environment'], 'PATH=/usr/bin:/bin\nGREETING=hello world\n')
@@ -1490,6 +1507,29 @@ class EasyBlockSpecificTest(TestCase):
         eb.fetch_step()
         eb.build_step()
         self.assertEqual([c for c in self.cs_calls if 'mksquashfs' in c or '--sandbox' in c], [])
+
+    def test_containerstack_image_entries(self):
+        """image_entries applies layers in order, with OCI whiteouts and opaque directories."""
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        layers = []
+        for members in ([('etc/hosts', b'one\n'), ('etc/resolv.conf', b'ns\n'), ('etc/a/x', b'x\n')],
+                        [('etc/.wh.resolv.conf', b''), ('etc/a/.wh..wh..opq', b''), ('./etc/hosts', b'two\n')]):
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode='w:gz') as tar:
+                for name, data in members:
+                    info = tarfile.TarInfo(name)
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+            digest = containerstack.sha256_digest(buf.getvalue())
+            path = containerstack.blob_path(blobs, digest)
+            mkdir(os.path.dirname(path), parents=True)
+            with open(path, 'wb') as fh:
+                fh.write(buf.getvalue())
+            layers.append({'digest': digest})
+        found = containerstack.image_entries(blobs, layers, ('etc/hosts', 'etc/resolv.conf', 'etc/a/x', 'etc/no'))
+        self.assertEqual(found['etc/hosts'][1], b'two\n')
+        self.assertEqual([found[p] for p in ('etc/resolv.conf', 'etc/a/x', 'etc/no')], [None, None, None])
+        self.assertEqual(containerstack.image_entries(blobs, layers[:1], ('etc/a/x',))['etc/a/x'][1], b'x\n')
 
     def test_containerstack_rootfs_writes_stay_inside(self):
         """enroot's /etc files replace image symlinks instead of writing through them; no write escapes the rootfs."""
