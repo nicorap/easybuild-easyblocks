@@ -620,6 +620,10 @@ class ContainerStack(EasyBlock):
     """
     Deploy a digest-pinned OCI image as a module, in enroot/pyxis (.sqsh) and Apptainer (.sif) formats.
 
+    Like pyxis' default and `apptainer exec`, the wrappers run the given command, not the image's ENTRYPOINT. Under
+    enroot this is done by etc/enroot-no-entrypoint.conf (installed with the .sqsh), an `enroot start --conf` hook
+    that writes 'exec "$@"' to the container's /etc/rc.local.
+
     Promotion (`eb --module-only` with hidden = False) must not use --force: EasyBuild then skips the sanity check,
     and with it the check that the install's manifest.json matches the pinned digest.
     """
