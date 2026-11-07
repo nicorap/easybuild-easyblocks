@@ -29,12 +29,14 @@ Unit tests for specific easyblocks.
 """
 import base64
 import copy
+import gzip
 import hashlib
 import http.server
 import io
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -195,6 +197,35 @@ def _cs_tiny_image(registry, tag='1.0', workdir='/work'):
          'platform': {'os': 'unknown', 'architecture': 'unknown'}}]}
     index_digest = registry.add_manifest(index, CS_OCI_INDEX, tag=tag)
     return {'manifest': manifest_digest, 'index': index_digest, 'config': config_digest, 'layer': layer_digest}
+
+
+def _cs_member(name, data=b'', kind=tarfile.REGTYPE, mode=0o644, linkname=''):
+    """(TarInfo, data) for a layer member: a file with 'data', or a directory, symlink or whiteout."""
+    info = tarfile.TarInfo(name)
+    info.type, info.mode, info.linkname = kind, mode, linkname
+    if kind == tarfile.REGTYPE:
+        info.size = len(data)
+        return info, io.BytesIO(data)
+    return info, None
+
+
+def _cs_layer(blobs, members, zstd=False):
+    """Write a layer blob (gzip, or zstd via the zstd command) of _cs_member()s to blobs; return its descriptor."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w') as tar:
+        for info, data in members:
+            tar.addfile(info, data)
+    if zstd:
+        blob = subprocess.run(['zstd', '-q', '-c'], input=buf.getvalue(), stdout=subprocess.PIPE, check=True).stdout
+    else:
+        blob = gzip.compress(buf.getvalue(), mtime=0)
+    digest = containerstack.sha256_digest(blob)
+    path = containerstack.blob_path(blobs, digest)
+    mkdir(os.path.dirname(path), parents=True)
+    with open(path, 'wb') as fh:
+        fh.write(blob)
+    return {'mediaType': 'application/vnd.oci.image.layer.v1.tar+%s' % ('zstd' if zstd else 'gzip'),
+            'digest': digest, 'size': len(blob)}
 
 
 class EasyBlockSpecificTest(TestCase):
@@ -1530,6 +1561,141 @@ class EasyBlockSpecificTest(TestCase):
         self.assertEqual(found['etc/hosts'][1], b'two\n')
         self.assertEqual([found[p] for p in ('etc/resolv.conf', 'etc/a/x', 'etc/no')], [None, None, None])
         self.assertEqual(containerstack.image_entries(blobs, layers[:1], ('etc/a/x',))['etc/a/x'][1], b'x\n')
+
+    def test_containerstack_image_entries_root_opaque_and_replaced_dirs(self):
+        """An opaque whiteout at the image root clears all lower layers; a non-directory hides what was beneath."""
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        lower = _cs_layer(blobs, [_cs_member('etc/hosts', b'one\n'), _cs_member('usr/lib/x', b'x\n'),
+                                  _cs_member('opt/y', b'y\n')])
+        root_opq = _cs_layer(blobs, [_cs_member('./.wh..wh..opq'), _cs_member('opt/y', b'new y\n')])
+        found = containerstack.image_entries(blobs, [lower, root_opq], ('etc/hosts', 'usr/lib/x', 'opt/y'))
+        self.assertEqual(found['etc/hosts'], None)
+        self.assertEqual(found['usr/lib/x'], None)
+        self.assertEqual(found['opt/y'][1], b'new y\n')    # same-layer entries survive the opaque marker
+        replaced = _cs_layer(blobs, [_cs_member('etc', kind=tarfile.SYMTYPE, linkname='private/etc'),
+                                     _cs_member('usr/lib', b'now a file\n')])
+        found = containerstack.image_entries(blobs, [lower, replaced], ('etc/hosts', 'usr/lib/x', 'opt/y', 'etc'))
+        self.assertEqual([found[p] for p in ('etc/hosts', 'usr/lib/x')], [None, None])
+        self.assertEqual(found['opt/y'][1], b'y\n')
+        self.assertTrue(found['etc'][0].issym())
+        # a later layer that has 'etc' as a directory again keeps the lower layer's files
+        etc_dir = _cs_layer(blobs, [_cs_member('etc', kind=tarfile.DIRTYPE, mode=0o755)])
+        self.assertEqual(containerstack.image_entries(blobs, [lower, etc_dir], ('etc/hosts',))['etc/hosts'][1],
+                         b'one\n')
+
+    def _cs_without_zstd_tarfile(self):
+        """Hide this Python's tarfile zstd support (as before Python 3.14) until the test ends."""
+        orig = tarfile.TarFile.OPEN_METH
+        tarfile.TarFile.OPEN_METH = dict((k, v) for k, v in orig.items() if k != 'zst')
+        self.addCleanup(setattr, tarfile.TarFile, 'OPEN_METH', orig)
+
+    def test_containerstack_zstd_layer_no_reader(self):
+        """A zstd layer with neither tarfile zstd support nor a zstd command: an error naming layer and tool."""
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        members = [_cs_member('etc/hosts', b'zstd hosts\n')]
+        if shutil.which('zstd'):
+            layer = _cs_layer(blobs, members, zstd=True)
+        else:    # the content is never read: the missing reader is reported first
+            layer = dict(_cs_layer(blobs, members), mediaType='application/vnd.oci.image.layer.v1.tar+zstd')
+        self._cs_without_zstd_tarfile()
+        os.environ['PATH'] = os.path.join(self.tmpdir, 'empty-path')
+        self.assertRaisesRegex(EasyBuildError, "layer %s is zstd-compressed.*no 'zstd' command" % layer['digest'],
+                               containerstack.image_entries, blobs, [layer], ('etc/hosts',))
+
+    def test_containerstack_zstd_layer_via_command(self):
+        """Without tarfile zstd support, a zstd layer is read through the zstd command."""
+        if not shutil.which('zstd'):
+            self.skipTest("no 'zstd' command in $PATH")
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        layers = [_cs_layer(blobs, [_cs_member('etc/hosts', b'one\n'), _cs_member('etc/resolv.conf', b'ns\n')]),
+                  _cs_layer(blobs, [_cs_member('etc/hosts', b'zstd hosts\n', mode=0o600),
+                                    _cs_member('etc/.wh.resolv.conf')], zstd=True)]
+        if containerstack.tarfile_reads_zstd():    # Python >= 3.14: tarfile itself
+            self.assertEqual(containerstack.image_entries(blobs, layers, ('etc/hosts',))['etc/hosts'][1],
+                             b'zstd hosts\n')
+        self._cs_without_zstd_tarfile()
+        self.assertFalse(containerstack.tarfile_reads_zstd())
+        found = containerstack.image_entries(blobs, layers, ('etc/hosts', 'etc/resolv.conf'))
+        self.assertEqual((found['etc/hosts'][1], found['etc/hosts'][0].mode), (b'zstd hosts\n', 0o600))
+        self.assertEqual(found['etc/resolv.conf'], None)
+
+    def test_containerstack_fixperms(self):
+        """enroot's fixperms: chmod -R u+rX, then u+w on directories as deep as enroot's find reaches them."""
+        root = os.path.join(self.tmpdir, 'rootfs')
+        outside = os.path.join(self.tmpdir, 'outside')
+        deep = [os.path.join(root, *['n%d' % i for i in range(1, depth + 1)]) for depth in range(1, 17)]
+        mkdir(deep[-1], parents=True)
+        mkdir(os.path.join(root, 'locked'))
+        mkdir(os.path.join(outside, 'dir'), parents=True)
+        files = {'f0000': 0o000, 'f0644': 0o644, 'f0700': 0o700, 'f0055': 0o055, 'locked/inner': 0o000,
+                 os.path.join(outside, 'target'): 0o000, os.path.join(outside, 'dir', 'g'): 0o000}
+        for rel, mode in files.items():
+            write_file(os.path.join(root, rel), 'x')
+        os.symlink(os.path.join(outside, 'target'), os.path.join(root, 'link'))
+        os.symlink(os.path.join(outside, 'dir'), os.path.join(root, 'dirlink'))
+        if hasattr(os, 'lchmod'):    # macOS: a symlink has a mode of its own; a chmod of the link must not happen
+            os.lchmod(os.path.join(root, 'link'), 0o000)
+        dirs = {'locked': 0o000, 'n1/n2': 0o555, deep[13]: 0o555, deep[14]: 0o555, deep[15]: 0o555,
+                os.path.join(outside, 'dir'): 0o555}
+        for rel, mode in list(files.items()) + sorted(dirs.items(), key=lambda kv: -len(kv[0])):
+            os.chmod(os.path.join(root, rel), mode)
+        try:
+            containerstack.enroot_fixperms(root)
+            modes = dict((rel, stat.S_IMODE(os.lstat(os.path.join(root, rel)).st_mode))
+                         for rel in list(files) + list(dirs))
+        finally:    # tearDown only adds u+w
+            os.chmod(os.path.join(root, 'locked'), 0o700)
+
+        def mode(rel):
+            return modes[rel]
+        # u+r everywhere; u+x on directories and on files that anyone may execute (X); never through a symlink
+        self.assertEqual(dict((rel, mode(rel)) for rel in files),
+                         {'f0000': 0o400, 'f0644': 0o644, 'f0700': 0o700, 'f0055': 0o555, 'locked/inner': 0o400,
+                          os.path.join(outside, 'target'): 0o000, os.path.join(outside, 'dir', 'g'): 0o000})
+        self.assertEqual(mode(os.path.join(outside, 'dir')), 0o555)
+        self.assertTrue(os.path.islink(os.path.join(root, 'link')) and os.path.islink(os.path.join(root, 'dirlink')))
+        # u+w on directories: enroot runs 'find . -maxdepth 15' in the directory holding one directory per layer,
+        # so an image directory n levels below the rootfs is at find depth n + 1
+        self.assertEqual((mode('locked'), mode('n1/n2')), (0o700, 0o755))
+        self.assertEqual([mode(d) for d in deep[13:]], [0o755, 0o555, 0o555])
+
+    def test_containerstack_sqsh_symlink_bind_target(self):
+        """An image whose /etc/hosts is a symlink gets that symlink back in the .sqsh, not Apptainer's file."""
+        seen = {}
+
+        def run(cmd, **kwargs):
+            sandbox = re.search(r'--sandbox (\S+) ', cmd)
+            if cmd.startswith('mksquashfs '):
+                hosts = os.path.join(cmd.split()[1], 'etc', 'hosts')
+                seen['hosts'] = os.readlink(hosts) if os.path.islink(hosts) else None
+            res = self._cs_fake_run(cmd, **kwargs)
+            if sandbox:
+                write_file(os.path.join(sandbox.group(1), 'etc', 'hosts.image'), 'via the image link\n')
+            return res
+
+        info = _cs_member('etc/hosts', kind=tarfile.SYMTYPE, linkname='hosts.image')[0]
+        orig = containerstack.image_entries
+        containerstack.image_entries = lambda *args: {'etc/hosts': (info, None), 'etc/resolv.conf': None}
+        self.addCleanup(setattr, containerstack, 'image_entries', orig)
+        eb, _ = self._cs_easyblock("formats = ['sqsh']\n")
+        eb.fetch_step()
+        containerstack.run_shell_cmd = run
+        eb.build_step()
+        self.assertEqual(seen['hosts'], 'hosts.image')
+        self.assertEqual(self.cs_squashed['hosts'], 'via the image link\n')
+
+    def test_containerstack_sqsh_root_mode_from_umask(self):
+        """The .sqsh root directory has the mode a plain mkdir gives it, as in 'enroot import': 0777 & ~umask."""
+        for umask, expected in ((0o022, 0o755), (0o002, 0o775)):
+            eb, _ = self._cs_easyblock("formats = ['sqsh']\n")
+            eb.fetch_step()
+            old = os.umask(umask)
+            try:
+                eb.build_step()
+                self.assertEqual(os.umask(umask), umask)    # the umask is left as it was
+            finally:
+                os.umask(old)
+            self.assertEqual(self.cs_squashed['modes'][''], expected)
 
     def test_containerstack_rootfs_writes_stay_inside(self):
         """enroot's /etc files replace image symlinks instead of writing through them; no write escapes the rootfs."""

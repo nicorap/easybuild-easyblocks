@@ -29,6 +29,7 @@ in enroot/pyxis (.sqsh) and Apptainer (.sif) formats.
 @author: Nicolas Rapin (FAIC)
 """
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -37,6 +38,7 @@ import shlex
 import shutil
 import socket
 import stat
+import subprocess
 import tarfile
 import time
 import urllib.error
@@ -47,9 +49,9 @@ from easybuild.easyblocks import VERSION as EASYBLOCKS_VERSION
 from easybuild.framework.easyblock import EasyBlock
 from easybuild.framework.easyconfig import CUSTOM
 from easybuild.tools.build_log import EasyBuildError, print_warning
-from easybuild.tools.config import build_option, log_path, source_paths
+from easybuild.tools.config import IGNORE, build_option, log_path, source_paths
 from easybuild.tools.filetools import adjust_permissions, copy_file, mkdir, read_file, remove_dir, remove_file
-from easybuild.tools.filetools import symlink, write_file
+from easybuild.tools.filetools import symlink, which, write_file
 from easybuild.tools.run import run_shell_cmd
 from easybuild.tools.systemtools import AARCH64, X86_64, get_cpu_architecture
 from easybuild.tools.version import VERSION as EASYBUILD_VERSION
@@ -72,6 +74,10 @@ SMOKE_DIR = 'smoke'
 APPTAINER_PATHS = ('.singularity.d', '.exec', '.run', '.shell', '.test', 'environment', 'singularity')
 # bind targets an Apptainer sandbox build empties or creates; put back exactly as the image layers have them
 APPTAINER_BIND_TARGETS = ('etc/hosts', 'etc/resolv.conf')
+OCI_LAYER_ZSTD = 'application/vnd.oci.image.layer.v1.tar+zstd'
+# enroot's fixperms runs 'find . -maxdepth 15' in the directory holding one directory per layer, so it reaches image
+# directories at most 14 levels below the rootfs
+ENROOT_FIXPERMS_DIR_DEPTH = 14
 ENROOT_RC_BODY = '''mkdir -p "%(workdir)s" 2> /dev/null
 cd "%(workdir)s" && unset OLDPWD || exit 1
 
@@ -382,23 +388,72 @@ def image_entries(blobs_dir, layers, paths):
     """
     found = dict((path, None) for path in paths)
     for layer in layers:
+        # gone: (path, whether the path itself goes too) for what this layer hides of the lower layers
         entries, gone = {}, []
-        with tarfile.open(blob_path(blobs_dir, layer['digest']), 'r:*') as tar:
+        with open_layer(blobs_dir, layer) as tar:
             for member in tar:
                 name = os.path.normpath('/' + member.name).lstrip('/')
                 parent, base = os.path.split(name)
                 if base == '.wh..wh..opq':
-                    gone.append(parent + '/')
+                    gone.append((parent, False))
                 elif base.startswith('.wh.'):
-                    gone.append(os.path.join(parent, base[4:]))
-                elif name in found:
-                    data = tar.extractfile(member).read() if member.isfile() or member.islnk() else None
-                    entries[name] = (member, data)
+                    gone.append((os.path.join(parent, base[4:]), True))
+                else:
+                    if not member.isdir():    # a non-directory replaces whatever the lower layers had beneath it
+                        gone.append((name, False))
+                    if name in found:
+                        data = tar.extractfile(member).read() if member.isfile() or member.islnk() else None
+                        entries[name] = (member, data)
         for path in found:
-            if any(path == g or path.startswith(g.rstrip('/') + '/') for g in gone):
+            if any(not g or path.startswith(g + '/') or (itself and path == g) for g, itself in gone):
                 found[path] = None
         found.update(entries)
     return found
+
+
+def tarfile_reads_zstd():
+    """Whether this Python's tarfile can read zstd (Python >= 3.14 with its zstd module)."""
+    if 'zst' not in tarfile.TarFile.OPEN_METH:
+        return False
+    try:
+        import compression.zstd  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def open_layer(blobs_dir, layer):
+    """
+    Open a verified layer blob as a TarFile. zstd layers are read by tarfile if it can, else streamed through
+    the 'zstd' command.
+    """
+    path = blob_path(blobs_dir, layer['digest'])
+    if layer.get('mediaType') != OCI_LAYER_ZSTD or tarfile_reads_zstd():
+        with tarfile.open(path, 'r:zst' if layer.get('mediaType') == OCI_LAYER_ZSTD else 'r:*') as tar:
+            yield tar
+        return
+    zstd = which('zstd', on_error=IGNORE)
+    if not zstd:
+        raise EasyBuildError("ContainerStack: layer %s is zstd-compressed, but this Python's tarfile cannot read "
+                             "zstd and there is no 'zstd' command in $PATH", layer['digest'])
+    proc = subprocess.Popen([zstd, '-q', '-d', '-c', path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        with tarfile.open(fileobj=proc.stdout, mode='r|') as tar:
+            yield tar
+        while proc.stdout.read(1 << 16):    # the rest (tar padding), so zstd never dies of SIGPIPE
+            pass
+    except BaseException:
+        proc.kill()
+        raise
+    finally:
+        proc.stdout.close()
+        err = proc.stderr.read().decode(errors='replace').strip()
+        proc.stderr.close()
+        proc.wait()
+    if proc.returncode:
+        raise EasyBuildError("ContainerStack: 'zstd -d' of layer %s failed (exit code %s): %s",
+                             layer['digest'], proc.returncode, err)
 
 
 def rootfs_path(rootfs, path):
@@ -412,6 +467,40 @@ def rootfs_path(rootfs, path):
         raise EasyBuildError("ContainerStack: image path %r leads outside the image rootfs %s; refusing it",
                              path, rootfs)
     return target
+
+
+def enroot_fixperms(rootfs):
+    """
+    The permission fix 'enroot import' applies to everything beneath the rootfs (enroot's common::fixperms):
+    'chmod -R u+rX' (u+r on all, u+x on directories and on files anyone may execute), then u+w on the directories
+    at most ENROOT_FIXPERMS_DIR_DEPTH levels below the rootfs. Symlinks are neither followed nor changed.
+    The rootfs directory itself is left alone (enroot makes it anew).
+    """
+    def fix(path, depth):
+        mode = os.lstat(path).st_mode
+        if stat.S_ISLNK(mode):
+            return
+        new = stat.S_IMODE(mode) | stat.S_IRUSR
+        if stat.S_ISDIR(mode):
+            new |= stat.S_IXUSR | (stat.S_IWUSR if depth <= ENROOT_FIXPERMS_DIR_DEPTH else 0)
+        elif mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+            new |= stat.S_IXUSR
+        if new != stat.S_IMODE(mode):
+            os.chmod(path, new)
+
+    # top-down: a directory is fixed (made readable and searchable) before os.walk lists it
+    for top, dirs, files in os.walk(rootfs):
+        rel = os.path.relpath(top, rootfs)
+        depth = 1 if rel == os.curdir else rel.count(os.sep) + 2
+        for name in dirs + files:
+            fix(os.path.join(top, name), depth)
+
+
+def current_umask():
+    """The process umask (os.umask can only read it by setting it: set it straight back)."""
+    mask = os.umask(0o022)
+    os.umask(mask)
+    return mask
 
 
 def remove_nofollow(path):
@@ -633,7 +722,7 @@ class ContainerStack(EasyBlock):
         run_shell_cmd(env + 'apptainer build --force --sandbox %s oci:%s' % (shlex.quote(rootfs), shlex.quote(layout)))
         for rel in APPTAINER_PATHS:
             remove_nofollow(os.path.join(rootfs, rel))
-        # as 'enroot import' has them: the image's own bind-target files, user-writable directories, a 0755 root
+        # as 'enroot import' has them: the image's own bind-target files, its permission fix, a plain mkdir's root
         for rel, entry in image_entries(self.blobs_dir, self.manifest['layers'], APPTAINER_BIND_TARGETS).items():
             path = rootfs_path(rootfs, rel)
             remove_nofollow(path)
@@ -643,12 +732,8 @@ class ContainerStack(EasyBlock):
                 with open(path, 'wb') as fh:
                     fh.write(entry[1])
                 os.chmod(path, entry[0].mode & 0o7777)
-        for top, dirs, _ in os.walk(rootfs):
-            for sub in dirs:
-                mode = os.lstat(os.path.join(top, sub)).st_mode
-                if stat.S_ISDIR(mode) and not mode & stat.S_IWUSR:
-                    os.chmod(os.path.join(top, sub), stat.S_IMODE(mode) | stat.S_IWUSR)
-        os.chmod(rootfs, 0o755)
+        enroot_fixperms(rootfs)
+        os.chmod(rootfs, 0o777 & ~current_umask())
         with open(blob_path(self.blobs_dir, self.manifest['config']['digest']), 'rb') as fh:
             config = json.loads(fh.read().decode())
         provenance = 'containerstack://%s@%s' % (self.cfg['image'], self.digest)
