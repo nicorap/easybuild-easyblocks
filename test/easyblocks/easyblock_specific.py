@@ -27,13 +27,21 @@ Unit tests for specific easyblocks.
 
 @author: Kenneth Hoste (Ghent University)
 """
+import base64
 import copy
+import hashlib
+import http.server
+import io
+import json
 import os
 import re
 import stat
+import subprocess
 import sys
+import tarfile
 import tempfile
 import textwrap
+import threading
 from pathlib import Path
 from unittest import TestLoader, TextTestRunner
 from test.easyblocks.module import cleanup
@@ -42,6 +50,7 @@ import easybuild.tools.options as eboptions
 import easybuild.tools.tomllib as tomllib
 import easybuild.easyblocks.generic.pythonpackage as pythonpackage
 import easybuild.easyblocks.generic.cargo as cargo
+import easybuild.easyblocks.generic.containerstack as containerstack
 import easybuild.easyblocks.l.lammps as lammps
 import easybuild.easyblocks.p.python as python
 import easybuild.easyblocks.p.pytorch as pytorch
@@ -53,9 +62,9 @@ from easybuild.framework.easyblock import EasyBlock, get_easyblock_instance
 from easybuild.framework.easyconfig.easyconfig import process_easyconfig
 from easybuild.tools import config
 from easybuild.tools.build_log import EasyBuildError
-from easybuild.tools.config import GENERAL_CLASS, get_module_syntax
+from easybuild.tools.config import GENERAL_CLASS, build_option, get_module_syntax, update_build_option
 from easybuild.tools.environment import modify_env
-from easybuild.tools.filetools import adjust_permissions, mkdir, move_file, remove_dir, symlink, write_file
+from easybuild.tools.filetools import adjust_permissions, mkdir, move_file, read_file, remove_dir, symlink, write_file
 from easybuild.tools.modules import modules_tool
 from easybuild.tools.options import set_tmpdir
 from easybuild.tools.run import RunShellCmdResult
@@ -919,6 +928,44 @@ class EasyBlockSpecificTest(TestCase):
                                pytorch.get_test_results, error_log_dir / 'consistency')
         self.assertRaisesRegex(ValueError, "Duplicate test",
                                pytorch.get_test_results, error_log_dir / 'duplicate')
+
+    def test_containerstack_select_digest(self):
+        """select_digest() returns the host-arch digest and explains every way a recipe can get it wrong."""
+        good = 'sha256:' + 'a' * 64
+        self.assertEqual(containerstack.select_digest({'x86_64': good}, 'x86_64'), good)
+        self.assertErrorRegex(EasyBuildError, "no digest for host architecture aarch64; recipe supports: x86_64",
+                              containerstack.select_digest, {'x86_64': good}, 'aarch64')
+        self.assertErrorRegex(EasyBuildError, "recipe supports: none", containerstack.select_digest, {}, 'x86_64')
+        self.assertErrorRegex(EasyBuildError, "not of the form sha256:<64 hex>",
+                              containerstack.select_digest, {'x86_64': 'sha256:abc'}, 'x86_64')
+        self.assertErrorRegex(EasyBuildError, "not of the form sha256:<64 hex>",
+                              containerstack.select_digest, {'x86_64': '26.10-py3'}, 'x86_64')
+
+    def test_containerstack_host_arch_key(self):
+        """EasyBuild's architecture names map to the recipe's digest keys; others are refused."""
+        orig = containerstack.get_cpu_architecture
+        try:
+            for arch, key in ((containerstack.X86_64, 'x86_64'), (containerstack.AARCH64, 'aarch64')):
+                containerstack.get_cpu_architecture = lambda arch=arch: arch
+                self.assertEqual(containerstack.host_arch_key(), key)
+            containerstack.get_cpu_architecture = lambda: 'POWER'
+            self.assertErrorRegex(EasyBuildError, "unsupported host architecture POWER", containerstack.host_arch_key)
+        finally:
+            containerstack.get_cpu_architecture = orig
+
+    def test_containerstack_split_image(self):
+        """Image references split into registry and repository; tags and digests are refused."""
+        split = containerstack.split_image
+        self.assertEqual(split('nvcr.io/nvidia/pytorch'), ('nvcr.io', 'nvidia/pytorch'))
+        self.assertEqual(split('python'), ('registry-1.docker.io', 'library/python'))
+        self.assertEqual(split('docker.io/library/python'), ('registry-1.docker.io', 'library/python'))
+        self.assertEqual(split('vllm/vllm-openai'), ('registry-1.docker.io', 'vllm/vllm-openai'))
+        self.assertEqual(split('127.0.0.1:5000/team/tiny'), ('127.0.0.1:5000', 'team/tiny'))
+        self.assertEqual(split('localhost/tiny'), ('localhost', 'tiny'))
+        for bad in ('nvcr.io/nvidia/pytorch:26.10-py3', 'python@sha256:' + 'a' * 64):
+            self.assertErrorRegex(EasyBuildError, "must not contain a tag or digest", split, bad)
+        self.assertEqual(containerstack.env_var_prefix('PyTorch-container'), 'PYTORCHCONTAINER')
+        self.assertEqual(containerstack.env_var_prefix('vLLM-container'), 'VLLMCONTAINER')
 
 
 def suite(loader):
