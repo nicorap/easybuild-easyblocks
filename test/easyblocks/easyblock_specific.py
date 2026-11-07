@@ -1825,7 +1825,9 @@ class EasyBlockSpecificTest(TestCase):
             res = subprocess.run([wrapper], env=env, capture_output=True, text=True, timeout=60)
             return res.returncode, res.stdout
 
-        for args in ('--overlap', '--gpus=1 --overlap', '--overlap=force', ' -N 1  --overlap '):
+        # anywhere in CS_SRUN_ARGS, which srun gets word-split on spaces, tabs and newlines alike
+        for args in ('--overlap', '--gpus=1 --overlap', '--overlap=force', ' -N 1  --overlap ', '-N 1\n--overlap',
+                     '--gpus=1\n\n\t--overlap=force\n'):
             self.assertEqual(run({'CS_RUNTIME': 'pyxis', 'CS_SRUN_ARGS': args}),
                              (0, 'srun --nodes=1 --ntasks=1 %s --container-image=%s python\n'
                                  % (' '.join(args.split()), sqsh)), args)
@@ -1869,8 +1871,12 @@ class EasyBlockSpecificTest(TestCase):
             for step in ('0', '7', '4294967289'):
                 self.assertEqual(run({var: step}), (0, 'apptainer\n'), (var, step))
                 self.assertEqual(run({var: step, 'CS_RUNTIME': 'pyxis'})[0], 1, (var, step))
-        # SLURM_STEP_ID is the one that counts when both are set
+        # SLURM_STEP_ID is the one that counts when both are set, unless it is empty (as if unset)
         self.assertEqual(run({'SLURM_STEP_ID': 'batch', 'SLURM_STEPID': '0'}), (0, 'srun\n'))
+        self.assertEqual(run({'SLURM_STEP_ID': '', 'SLURM_STEPID': '0'}), (0, 'apptainer\n'))
+        self.assertEqual(run({'SLURM_STEP_ID': '', 'SLURM_STEPID': '0', 'CS_RUNTIME': 'pyxis'})[0], 1)
+        self.assertEqual(run({'SLURM_STEP_ID': '', 'SLURM_STEPID': 'batch'}), (0, 'srun\n'))
+        self.assertEqual(run({'SLURM_STEP_ID': ''}), (0, 'srun\n'))
 
     def test_containerstack_apptainer_triton_libcuda(self):
         """With --nv, Apptainer gets TRITON_LIBCUDA_PATH=/.singularity.d/libs, unless the caller set it already."""
