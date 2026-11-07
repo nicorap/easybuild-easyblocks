@@ -219,6 +219,9 @@ class EasyBlockSpecificTest(TestCase):
         self.cs_orig = (containerstack.run_shell_cmd, containerstack.source_paths, containerstack.host_arch_key,
                         containerstack.disk_free, EasyBlock.sanity_check_step, EasyBlock.make_module_step)
         self.cs_orig_opts = {opt: build_option(opt) for opt in ('module_only', 'sanity_check_only', 'force')}
+        # test.easyblocks.suite runs this after module.py, which leaves --module-only --force set
+        for opt in self.cs_orig_opts:
+            update_build_option(opt, False)
         self.cs_fail = {}
         self.cs_calls = []
         self.cs_squashed = {}
