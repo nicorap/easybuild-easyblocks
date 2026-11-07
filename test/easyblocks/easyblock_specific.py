@@ -1189,6 +1189,76 @@ class EasyBlockSpecificTest(TestCase):
         self.assertFalse(os.path.exists(dest + '.part'))
         self.assertEqual(reg.cdn_auth, [None])
 
+    def test_containerstack_fetch_and_verify(self):
+        """fetch_oci_blobs() stores manifest, config and layers by digest; verify_oci_blobs() re-checks them."""
+        _, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        manifest = containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        self.assertEqual(manifest['config']['digest'], img['config'])
+        expected = sorted(d.split(':')[1] for d in (img['manifest'], img['config'], img['layer']))
+        self.assertEqual(sorted(os.listdir(blobs)), expected)
+        self.assertEqual(containerstack.verify_oci_blobs(blobs, img['manifest']), manifest)
+
+    def test_containerstack_fetch_reuses_cache(self):
+        """A second fetch of a verified cache makes no registry requests at all."""
+        reg, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        before = len(reg.requests)
+        containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        self.assertEqual(reg.requests[before:], [])
+
+    def test_containerstack_corrupt_cache_refetched(self):
+        """Corrupt, missing or half-downloaded cached blobs are detected and fetched again, never trusted."""
+        reg, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        layer = containerstack.blob_path(blobs, img['layer'])
+        with open(layer, 'r+b') as fh:
+            fh.seek(10)
+            byte = fh.read(1)
+            fh.seek(10)
+            fh.write(bytes([byte[0] ^ 0xff]))
+        self.assertRaisesRegex(EasyBuildError, "blob %s is corrupt" % img['layer'],
+                               containerstack.verify_oci_blobs, blobs, img['manifest'])
+        write_file(layer + '.part', 'junk from an interrupted download')
+        self.mock_stdout(True)
+        self.mock_stderr(True)
+        containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        self.mock_stdout(False)
+        self.mock_stderr(False)
+        self.assertTrue(reg.blob_requests()[-1].endswith(img['layer']))
+        containerstack.verify_oci_blobs(blobs, img['manifest'])
+        self.assertFalse(os.path.exists(layer + '.part'))
+        os.remove(layer)
+        self.assertRaisesRegex(EasyBuildError, "blob %s is missing" % img['layer'],
+                               containerstack.verify_oci_blobs, blobs, img['manifest'])
+
+    def test_containerstack_tampered_download_refused(self):
+        """A blob whose downloaded bytes do not match its digest is refused and leaves no file behind."""
+        reg, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        reg.tamper_blobs = True
+        self.assertRaisesRegex(EasyBuildError, "refusing it", containerstack.fetch_oci_blobs, client,
+                               img['manifest'], blobs)
+        self.assertEqual(os.listdir(blobs), [img['manifest'].split(':')[1]])
+
+    def test_containerstack_oci_layout(self):
+        """write_oci_layout() makes an OCI layout whose blobs are the shared store; rewriting is idempotent."""
+        _, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        layout = os.path.join(self.tmpdir, 'layout')
+        for _ in range(2):
+            containerstack.write_oci_layout(layout, blobs, img['manifest'], CS_OCI_MANIFEST)
+        index = json.loads(read_file(os.path.join(layout, 'index.json')))
+        self.assertEqual(index['manifests'][0]['digest'], img['manifest'])
+        self.assertEqual(index['manifests'][0]['size'],
+                         os.path.getsize(containerstack.blob_path(blobs, img['manifest'])))
+        self.assertTrue(os.path.islink(os.path.join(layout, 'blobs', 'sha256')))
+        self.assertTrue(os.path.isfile(os.path.join(layout, 'blobs', 'sha256', img['layer'].split(':')[1])))
+        self.assertEqual(json.loads(read_file(os.path.join(layout, 'oci-layout'))), {'imageLayoutVersion': '1.0.0'})
+
 
 def suite(loader):
     """Return all easyblock-specific tests."""

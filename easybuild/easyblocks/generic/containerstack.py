@@ -256,3 +256,70 @@ class RegistryClient:
                 if platform.get('os') == 'linux' and platform.get('architecture') == goarch:
                     digests.setdefault(key, entry['digest'])
         return digests
+
+
+def blob_path(blobs_dir, digest):
+    """Path of blob digest in a content-addressed store (an OCI layout's blobs/sha256 directory)."""
+    return os.path.join(blobs_dir, digest.split(':', 1)[1])
+
+
+def verify_blob(path, digest):
+    """True if the file at path has the given digest."""
+    return file_sha256(path) == digest
+
+
+def fetch_oci_blobs(client, digest, blobs_dir):
+    """
+    Fetch manifest digest and the config and layers it references into blobs_dir, checking every sha256.
+    Cached blobs are re-verified; corrupt or half-downloaded ones are fetched again. Returns the manifest.
+    """
+    mkdir(blobs_dir, parents=True)
+    path = blob_path(blobs_dir, digest)
+    if os.path.isfile(path) and verify_blob(path, digest):
+        with open(path, 'rb') as fh:
+            data = fh.read()
+    else:
+        data, _ = client.fetch_manifest(digest)
+        with open(path, 'wb') as fh:
+            fh.write(data)
+    manifest = json.loads(data.decode())
+    for blob in [manifest['config']] + manifest['layers']:
+        target = blob_path(blobs_dir, blob['digest'])
+        if os.path.isfile(target):
+            if verify_blob(target, blob['digest']):
+                continue
+            print_warning("ContainerStack: cached blob %s is corrupt; fetching it again" % blob['digest'])
+            remove_file(target)
+        client.fetch_blob(blob['digest'], target)
+    return manifest
+
+
+def verify_oci_blobs(blobs_dir, digest):
+    """Re-check the manifest and every blob it references; returns the manifest, or names the first bad blob."""
+    def check(blob_digest):
+        path = blob_path(blobs_dir, blob_digest)
+        if not os.path.isfile(path):
+            raise EasyBuildError("ContainerStack: blob %s is missing from %s", blob_digest, blobs_dir)
+        if not verify_blob(path, blob_digest):
+            raise EasyBuildError("ContainerStack: blob %s is corrupt (sha256 mismatch) in %s; run eb again to "
+                                 "re-fetch it", blob_digest, blobs_dir)
+        return path
+
+    with open(check(digest), 'rb') as fh:
+        manifest = json.loads(fh.read().decode())
+    for blob in [manifest['config']] + manifest['layers']:
+        check(blob['digest'])
+    return manifest
+
+
+def write_oci_layout(layout_dir, blobs_dir, digest, media_type):
+    """OCI image layout in layout_dir for manifest digest, whose blobs/sha256 is a symlink to blobs_dir."""
+    mkdir(os.path.join(layout_dir, 'blobs'), parents=True)
+    link = os.path.join(layout_dir, 'blobs', 'sha256')
+    if os.path.lexists(link):
+        remove_file(link)
+    symlink(blobs_dir, link)
+    write_file(os.path.join(layout_dir, 'oci-layout'), json.dumps({'imageLayoutVersion': '1.0.0'}))
+    size = os.path.getsize(blob_path(blobs_dir, digest))
+    index = {'schemaVersion': 2, 'manifests': [{'mediaType': media_type, 'digest': digest, 'size': size}]}
+    write_file(os.path.join(layout_dir, 'index.json'), json.dumps(index))
