@@ -1533,7 +1533,9 @@ class EasyBlockSpecificTest(TestCase):
         eb, _ = self._cs_easyblock()
         eb.fetch_step()
         containerstack.disk_free = lambda path: 10
+        self.cs_calls = []
         self.assertRaisesRegex(EasyBuildError, r"GiB free in .*, need .* GiB \(3x the image size\)", eb.build_step)
+        self.assertEqual([c for c in self.cs_calls if 'apptainer' in c or 'mksquashfs' in c], [])
 
     def test_containerstack_install_step(self):
         """install_step copies images and writes wrappers and site.env, but no manifest yet."""
@@ -1716,9 +1718,15 @@ class EasyBlockSpecificTest(TestCase):
                 self.assertFalse(os.access(os.path.join(eb.installdir, rel), os.W_OK), rel)
 
     def test_containerstack_module_extra(self):
-        """The module sets <PREFIX>_SQSH, <PREFIX>_SIF and <PREFIX>_DIGEST."""
+        """The module puts bin/ on PATH and sets <PREFIX>_SQSH, <PREFIX>_SIF and <PREFIX>_DIGEST."""
         eb, img = self._cs_easyblock()
-        txt = eb.make_module_extra()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        eb.make_module_step(fake=True)
+        txt = read_file(eb.module_generator.get_module_filepath(fake=True))
+        with eb.module_generator.start_module_creation():
+            self.assertIn(eb.module_generator.prepend_paths('PATH', ['bin']), txt)
         for var, value in (('TINYCONTAINER_SQSH', os.path.join(eb.installdir, 'image.sqsh')),
                            ('TINYCONTAINER_SIF', os.path.join(eb.installdir, 'image.sif')),
                            ('TINYCONTAINER_DIGEST', img['manifest'])):
