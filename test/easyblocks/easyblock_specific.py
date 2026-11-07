@@ -1422,6 +1422,41 @@ class EasyBlockSpecificTest(TestCase):
                              env={'PATH': fakebin + ':/usr/bin:/bin', 'CS_GPU_DEVICE': '/nonexistent'})
         self.assertEqual(res.stdout.splitlines()[:5], ['TOOL apptainer', 'ARG exec', 'ARG ' + sif, 'ARG sh', 'ARG -c'])
 
+    def test_containerstack_enroot_skips_entrypoint(self):
+        """Under enroot the wrappers run their command, not the image's entrypoint (as pyxis and Apptainer do)."""
+        eb, _ = self._cs_easyblock()
+        eb.fetch_step()
+        eb.build_step()
+        eb.install_step()
+        conf = os.path.join(eb.installdir, 'etc', 'enroot-no-entrypoint.conf')
+        self.assertTrue(os.path.isfile(conf))
+        # the wrapper passes the hook to 'enroot start'
+        fakebin = os.path.join(self.tmpdir, 'fakebin')
+        write_file(os.path.join(fakebin, 'enroot'), '#!/bin/bash\nfor a in "$@"; do echo "ARG $a"; done\n')
+        adjust_permissions(os.path.join(fakebin, 'enroot'), stat.S_IXUSR, add=True)
+        res = subprocess.run([os.path.join(eb.installdir, 'bin', 'greet')], capture_output=True, text=True,
+                             env={'PATH': fakebin + ':/usr/bin:/bin', 'CS_RUNTIME': 'enroot',
+                                  'CS_GPU_DEVICE': '/nonexistent'})
+        out = res.stdout.splitlines()
+        self.assertEqual(out[:3], ['ARG start', 'ARG --conf', 'ARG ' + os.path.realpath(conf)])
+        # what the hook does to enroot's /etc/rc: the command runs instead of the entrypoint; no command -> as before
+        rootfs, workdir = os.path.join(self.tmpdir, 'rootfs'), os.path.join(self.tmpdir, 'workdir')
+        files = containerstack.enroot_files({'config': {'Entrypoint': ['echo', 'ENTRY'], 'Cmd': ['default'],
+                                                        'WorkingDir': workdir}}, 'p')
+        write_file(os.path.join(rootfs, 'etc', 'rc.local'), files['etc/rc.local'])
+        rc = os.path.join(rootfs, 'etc', 'rc')
+        write_file(rc, files['etc/rc'].replace('/etc/rc.local', os.path.join(rootfs, 'etc', 'rc.local')))
+
+        def start(*args):
+            return subprocess.run(['bash', rc] + list(args), capture_output=True, text=True).stdout
+
+        self.assertEqual(start('echo', 'hi'), 'ENTRY echo hi\n')    # plain enroot: entrypoint + command
+        subprocess.run(['bash', '-c', 'source "$1" && hooks', '-', conf], check=True,
+                       env={'PATH': '/usr/bin:/bin', 'ENROOT_ROOTFS': rootfs})
+        self.assertEqual(start('echo', 'hi'), 'hi\n')
+        self.assertEqual(start('pwd', '-P'), os.path.realpath(workdir) + '\n')    # still in the image's WorkingDir
+        self.assertEqual(start(), 'ENTRY default\n')
+
     def _cs_fake_run(self, cmd, **kwargs):
         """Stand-in for run_shell_cmd: records commands and fakes the files Apptainer/mksquashfs would make."""
         self.cs_calls.append(cmd)
