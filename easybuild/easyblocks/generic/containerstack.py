@@ -626,14 +626,16 @@ class ContainerStack(EasyBlock):
     def run_smoke_tests(self):
         """Run every smoke test in every format; returns the results, raises on the first failure."""
         tests = [tuple(test) for test in self.cfg['smoke_tests']]
+        gpu_tests = [cmd for kind, cmd in tests if kind == 'gpu']
         require_gpu = self.cfg['require_gpu_tests']
+        if require_gpu and not gpu_tests:
+            raise EasyBuildError("ContainerStack: require_gpu_tests is set but no smoke test is tagged gpu")
         if require_gpu is None:
-            require_gpu = any(kind == 'gpu' for kind, _ in tests)
+            require_gpu = bool(gpu_tests)
         gpu = os.path.exists(os.environ.get('CS_GPU_DEVICE', '/dev/nvidia0'))
         if require_gpu and not gpu:
-            command = [cmd for kind, cmd in tests if kind == 'gpu'][0]
             raise EasyBuildError("ContainerStack: GPU smoke test %r cannot run: no GPU on %s; build on a GPU node "
-                                 "or set require_gpu_tests = False", command, socket.gethostname())
+                                 "or set require_gpu_tests = False", gpu_tests[0], socket.gethostname())
         results = []
         for fmt in self.cfg['formats']:
             for kind, command in tests:

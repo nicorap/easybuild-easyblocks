@@ -1537,6 +1537,15 @@ class EasyBlockSpecificTest(TestCase):
         results = eb.run_smoke_tests()
         self.assertEqual(sorted({r['result'] for r in results if r['kind'] == 'gpu'}), ['not-run: no GPU'])
 
+    def test_containerstack_require_gpu_without_gpu_tests(self):
+        """require_gpu_tests = True with no 'gpu' smoke test is a recipe error, with or without a GPU."""
+        eb, _ = self._cs_easyblock("require_gpu_tests = True\nsmoke_tests = [('cpu', 'true')]\n")
+        eb.fetch_step()
+        for present in (False, True):
+            self._cs_gpu(present)
+            self.assertRaisesRegex(EasyBuildError, "require_gpu_tests is set but no smoke test is tagged gpu",
+                                   eb.run_smoke_tests)
+
     def test_containerstack_no_manifest_on_failure(self):
         """manifest.json appears only after every smoke test passed, and records what was installed."""
         EasyBlock.sanity_check_step = lambda self, *args, **kwargs: None
