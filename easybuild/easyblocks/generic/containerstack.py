@@ -524,9 +524,18 @@ def read_image_config(blobs_dir, manifest):
 
 
 def image_user(image_config):
-    """The User the image config names (None if unset), and whether that is a user other than root."""
-    user = (image_config.get('config') or {}).get('User') or None
-    return user, bool(user) and user.split(':', 1)[0] not in ('', '0', 'root')
+    """
+    The User the image config names (a string; None if unset or empty), and whether that is a user other than root.
+    As in the OCI image spec, User is 'user', 'uid', 'user:group' or 'uid:gid' (or a mix), and empty means the
+    default user, root; so does an empty user part (':1000': root, with group 1000), as runc reads it. Root is uid 0
+    or the name 'root'.
+    """
+    user = (image_config.get('config') or {}).get('User')
+    user = '' if user is None else str(user).strip()
+    if not user:
+        return None, False
+    name = user.split(':', 1)[0]
+    return user, not (name in ('', 'root') or (name.isdigit() and int(name) == 0))
 
 
 def layer_path(name):
@@ -860,8 +869,9 @@ class ContainerStack(EasyBlock):
     environment file has one variable per line).
 
     An image's User (config.User, e.g. '1000:1000' or 'appuser') is ignored, as 'enroot import' ignores it (enroot
-    4.2.0's docker::configure never reads it) and as `apptainer exec` does: under every runtime the container runs as
-    the calling user. The build warns about a non-root User, and manifest.json records it as image_user.
+    4.2.0's docker::configure, src/docker.sh, never reads it) and as `apptainer exec` does: under every runtime the
+    container runs as the calling user (or as root with enroot --root, pyxis --container-remap-root or apptainer
+    --fakeroot). The build warns about a non-root User (see image_user), and manifest.json records it as image_user.
 
     Promotion (`eb --module-only` with hidden = False) must not use --force: EasyBuild then skips the sanity check,
     and with it the check that the install's manifest.json matches the pinned digest.
@@ -955,8 +965,8 @@ class ContainerStack(EasyBlock):
         user, non_root = image_user(read_image_config(self.blobs_dir, self.manifest))
         if non_root:
             print_warning("ContainerStack: image sets User %r, which enroot and Apptainer ignore: the container runs "
-                          "as the calling user (as with enroot import and apptainer exec), not as %s" % (user, user),
-                          log=self.log)
+                          "as the calling user (or as root with enroot --root, pyxis --container-remap-root or "
+                          "apptainer --fakeroot), not as %s" % (user, user), log=self.log)
         need = sum(layer['size'] for layer in self.manifest['layers']) * self.cfg['min_free_space_factor']
         free = disk_free(self.builddir)
         if free < need:

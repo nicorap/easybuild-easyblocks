@@ -1850,7 +1850,8 @@ class EasyBlockSpecificTest(TestCase):
         EasyBlock.sanity_check_step = lambda self, *args, **kwargs: None
         self._cs_gpu(True)
         etc = {}
-        for user in (None, 'root', '0:0', '1000:1000', 'appuser'):
+        for user, recorded in ((None, None), ('', None), ('root', 'root'), ('0:0', '0:0'), (':1000', ':1000'),
+                               ('1000:1000', '1000:1000'), ('appuser', 'appuser'), (1000, '1000')):
             eb, _ = self._cs_easyblock(user=user)
             with self.mocked_stdout_stderr() as (stdout, stderr):
                 eb.fetch_step()
@@ -1858,12 +1859,24 @@ class EasyBlockSpecificTest(TestCase):
                 eb.install_step()
                 eb.sanity_check_step()
             output = stdout.getvalue() + stderr.getvalue()
-            warning = ("image sets User %r, which enroot and Apptainer ignore: the container runs as the calling user"
-                       % user)
-            self.assertEqual(warning in output, user in ('1000:1000', 'appuser'), (user, output))
+            warning = ("image sets User %r, which enroot and Apptainer ignore: the container runs as the calling user "
+                       "(or as root with enroot --root, pyxis --container-remap-root or apptainer --fakeroot), not as "
+                       "%s" % (recorded, recorded))
+            self.assertEqual(warning in output, recorded in ('1000:1000', 'appuser', '1000'), (user, output))
+            self.assertEqual(output.count('image sets User'), int(warning in output), output)
             manifest = json.loads(read_file(os.path.join(eb.installdir, 'manifest.json')))
-            self.assertEqual(manifest['image_user'], user)
+            self.assertEqual(manifest['image_user'], recorded)
             etc[user] = (self.cs_squashed['rc'].split('\n', 1)[1], self.cs_squashed['environment'])
+        # OCI image config User: '' means the default user (root); 'user', 'uid', 'user:group' or 'uid:gid', where
+        # an empty user part (':1000') also means the default user (root, here with group 1000)
+        for user, expected in ((None, (None, False)), ('', (None, False)), ('  ', (None, False)),
+                               ('0', ('0', False)), ('00', ('00', False)), ('0:0', ('0:0', False)), (0, ('0', False)),
+                               ('root', ('root', False)), ('root:x', ('root:x', False)), (':1000', (':1000', False)),
+                               ('1000', ('1000', True)), ('1000:0', ('1000:0', True)), ('appuser', ('appuser', True)),
+                               (1000, ('1000', True)), (' appuser ', ('appuser', True))):
+            config = {'config': {} if user is None else {'User': user}}
+            self.assertEqual(containerstack.image_user(config), expected, repr(user))
+        self.assertEqual(containerstack.image_user({}), (None, False))
         # the .sqsh's /etc files do not depend on User, as with enroot import (docker::configure never reads it)
         self.assertEqual(len(set(etc.values())), 1, etc)
         casedir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'containerstack_enroot', 'nginx')
