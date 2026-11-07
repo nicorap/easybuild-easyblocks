@@ -559,6 +559,18 @@ def read_image_config(blobs_dir, manifest):
         return json.loads(fh.read().decode())
 
 
+def image_pythonpath(image_config):
+    """
+    The PYTHONPATH the image's ENV sets (config.Env, its last PYTHONPATH= entry), verbatim ('a::b' stays so, ''
+    stays empty); None if the image sets none.
+    """
+    value = None
+    for var in (image_config.get('config') or {}).get('Env') or []:
+        if var.startswith('PYTHONPATH='):
+            value = var[len('PYTHONPATH='):]
+    return value
+
+
 def image_user(image_config):
     """
     The User the image config names (a string; None if unset or empty), and whether that is a user other than root.
@@ -826,19 +838,23 @@ WRAPPER_TEMPLATE = r'''#!/bin/bash
 # No runtime gets the caller's PYTHONPATH or PYTHONHOME: they name a host Python's paths (e.g. a loaded Python module's
 # site-packages), which the container's Python cannot use and which are not mounted; image ENV and site.env still set
 # them. PYTHONUSERBASE and PYTHONNOUSERSITE go in (the user site is per Python version; the default is in $HOME).
-# CS_PYTHONPATH (paths as the container sees them, e.g. CS_PYTHONPATH=$HOME/Megatron-LM) is the container's PYTHONPATH
-# under every runtime: it replaces the image's ENV PYTHONPATH (append that yourself if needed); site.env beats it.
+# CS_PYTHONPATH (paths as the container sees them, e.g. CS_PYTHONPATH=$HOME/Megatron-LM) goes first on the container's
+# PYTHONPATH under every runtime, before the image's ENV PYTHONPATH (image_pythonpath, read at build time); site.env
+# beats both. Unset or empty, the image's ENV PYTHONPATH applies untouched.
 root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)" || exit 1
 sqsh="$root/image.sqsh"
 sif="$root/image.sif"
 cname=%(cname)s
 mounts=(%(mounts)s)
 cmd=(%(cmd)s)
+image_pythonpath=%(image_pythonpath)s
 names=()
 unset PYTHONPATH PYTHONHOME
 if [ -n "${CS_PYTHONPATH:-}" ]; then
-    # forwarded by name, like site.env, so that it beats image ENV; before site.env, which beats it
-    export PYTHONPATH="$CS_PYTHONPATH" APPTAINERENV_PYTHONPATH="$CS_PYTHONPATH"
+    # forwarded by name, like site.env, so that it beats image ENV (whose value it keeps after its own); before
+    # site.env, which beats it
+    pythonpath="$CS_PYTHONPATH${image_pythonpath:+:$image_pythonpath}"
+    export PYTHONPATH="$pythonpath" APPTAINERENV_PYTHONPATH="$pythonpath"
     names+=(PYTHONPATH)
 fi
 if [ -r "$root/etc/site.env" ]; then
@@ -957,8 +973,11 @@ def tcl_string(text):
     return '"%s"' % escape_chars(text, '\\"[]${}', '\\%03o')
 
 
-def render_wrapper(name, version, digest, command, policy, binds):
-    """Bash wrapper that runs command (shell words; '' runs the wrapper's own arguments) in the container."""
+def render_wrapper(name, version, digest, command, policy, binds, image_pythonpath=None):
+    """
+    Bash wrapper that runs command (shell words; '' runs the wrapper's own arguments) in the container.
+    image_pythonpath: the image's ENV PYTHONPATH (None: none), kept after CS_PYTHONPATH when that is set.
+    """
     if policy not in POLICIES:
         raise EasyBuildError("ContainerStack: launch_policy must be one of %s, not %r", ', '.join(POLICIES), policy)
     mounts = [bind if ':' in bind else '%s:%s' % (bind, bind) for bind in binds]
@@ -968,6 +987,7 @@ def render_wrapper(name, version, digest, command, policy, binds):
         'cname': shlex.quote(cname),
         'mounts': ' '.join(shlex.quote(m) for m in mounts),
         'cmd': ' '.join(shlex.quote(w) for w in shlex.split(command)),
+        'image_pythonpath': shlex.quote(image_pythonpath or ''),
     }
 
 
@@ -997,11 +1017,14 @@ class ContainerStack(EasyBlock):
     in the container, so the container's Python would silently miss them or mix them with its own. The image's ENV
     and site_env still set them. To put paths of one's own on the container's PYTHONPATH (e.g. a Megatron-LM
     checkout in $HOME), set CS_PYTHONPATH: the wrappers pass it in as PYTHONPATH by name, as site_env is passed
-    (pyxis --container-env, APPTAINERENV_PYTHONPATH, enroot --env), so under every runtime it replaces the image's
-    ENV PYTHONPATH (the host cannot read the image's value to add to it: include it in CS_PYTHONPATH if needed) and
-    site_env's PYTHONPATH beats it. PYTHONUSERBASE and PYTHONNOUSERSITE are passed on as before: the user site is
-    per Python version (lib/pythonX.Y), it is the user's own choice, and dropping PYTHONUSERBASE would only send the
-    container's Python to ~/.local (mounted with $HOME by default); PYTHONNOUSERSITE=1 is the switch that hides it.
+    (pyxis --container-env, APPTAINERENV_PYTHONPATH, enroot --env), followed by the image's own ENV PYTHONPATH
+    (e.g. /opt/launcher_scripts::/opt/megatron-lm, kept verbatim), which the build reads from the image config,
+    records in manifest.json as image_pythonpath and writes into the wrappers; so under every runtime CS_PYTHONPATH
+    comes first and the image's paths still follow, and site_env's PYTHONPATH beats both. With CS_PYTHONPATH unset
+    or empty the image's ENV PYTHONPATH applies untouched. PYTHONUSERBASE and PYTHONNOUSERSITE are passed on as
+    before: the user site is per Python version (lib/pythonX.Y), it is the user's own choice, and dropping
+    PYTHONUSERBASE would only send the container's Python to ~/.local (mounted with $HOME by default);
+    PYTHONNOUSERSITE=1 is the switch that hides it.
     A module with launchers named python* prints a one-line warning when it is loaded while a host Python module is
     (EBROOTPYTHON is set): its python now shadows the host's, whose packages the container cannot see.
 
@@ -1172,11 +1195,31 @@ class ContainerStack(EasyBlock):
         write_file(os.path.join(self.installdir, 'etc', 'site.env'), site_env)
         if 'sqsh' in self.cfg['formats']:
             write_file(os.path.join(self.installdir, ENROOT_NO_ENTRYPOINT), ENROOT_NO_ENTRYPOINT_CONF)
+        self.write_wrappers()
+
+    def recorded_image_pythonpath(self):
+        """
+        The image's ENV PYTHONPATH (None: none): from the image config once build_step has read it, else (no build:
+        --module-only, a re-render) as manifest.json recorded it; an older manifest.json without it counts as none.
+        """
+        if self.image_config is not None:
+            return image_pythonpath(self.image_config)
+        manifest_path = os.path.join(self.installdir, MANIFEST)
+        if not os.path.isfile(manifest_path):
+            return None
+        return json.loads(read_file(manifest_path)).get('image_pythonpath')
+
+    def write_wrappers(self):
+        """Write bin/.cs-run and a wrapper per launcher."""
+        if self.digest is None:
+            self._validate()
+        bindir = os.path.join(self.installdir, 'bin')
+        pythonpath = self.recorded_image_pythonpath()
         launchers = dict(self.cfg['launchers'], **{'.cs-run': ''})
         for name, command in sorted(launchers.items()):
             path = os.path.join(bindir, name)
-            write_file(path, render_wrapper(self.name, self.version, self.digest, command,
-                                            self.cfg['launch_policy'], self.cfg['binds']))
+            write_file(path, render_wrapper(self.name, self.version, self.digest, command, self.cfg['launch_policy'],
+                                            self.cfg['binds'], image_pythonpath=pythonpath))
             adjust_permissions(path, stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH, add=True)
 
     def _smoke_cmd(self, fmt, command):
@@ -1250,6 +1293,7 @@ class ContainerStack(EasyBlock):
             'registry': self.registry, 'repository': self.repo, 'arch': self.arch_key, 'digest': self.digest,
             'config_digest': self.manifest['config']['digest'],
             'image_user': image_user(self.image_config)[0],
+            'image_pythonpath': image_pythonpath(self.image_config),
             'layers': [layer['digest'] for layer in self.manifest['layers']],
             'files': files, 'runtimes': self.runtime_versions(), 'smoke_tests': results,
             'easybuild': str(EASYBUILD_VERSION), 'easyblocks': str(EASYBLOCKS_VERSION),

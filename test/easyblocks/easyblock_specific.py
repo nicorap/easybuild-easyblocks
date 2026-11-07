@@ -209,8 +209,11 @@ class _CSFakeRegistry:
         return [r for r in self.requests if '/blobs/' in r]
 
 
-def _cs_tiny_image(registry, tag='1.0', workdir='/work', user=None):
-    """Push a one-layer image (file etc/greeting) and a multi-arch index to the fake registry; return digests."""
+def _cs_tiny_image(registry, tag='1.0', workdir='/work', user=None, env=()):
+    """
+    Push a one-layer image (file etc/greeting) and a multi-arch index to the fake registry; return digests.
+    env: more config.Env entries ('NAME=value').
+    """
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode='w:gz') as tar:
         for name, data in (('etc/greeting', b'hello\n'), ('./etc/hosts', b'127.0.0.1 localhost\n')):
@@ -222,7 +225,8 @@ def _cs_tiny_image(registry, tag='1.0', workdir='/work', user=None):
         tar.addfile(info)
     layer = buf.getvalue()
     config = {'architecture': 'amd64', 'os': 'linux', 'rootfs': {'type': 'layers', 'diff_ids': []},
-              'config': {'Env': ['PATH=/usr/bin:/bin', 'GREETING=hello world'], 'Cmd': ['sh'], 'WorkingDir': workdir}}
+              'config': {'Env': ['PATH=/usr/bin:/bin', 'GREETING=hello world'] + list(env), 'Cmd': ['sh'],
+                         'WorkingDir': workdir}}
     if user is not None:
         config['config']['User'] = user
     config = json.dumps(config).encode()
@@ -1187,11 +1191,11 @@ class EasyBlockSpecificTest(TestCase):
         self.assertEqual(containerstack.env_var_prefix('PyTorch-container'), 'PYTORCHCONTAINER')
         self.assertEqual(containerstack.env_var_prefix('vLLM-container'), 'VLLMCONTAINER')
 
-    def _cs_registry(self, workdir='/work', user=None):
+    def _cs_registry(self, workdir='/work', user=None, env=()):
         """Fake registry with the tiny image, and a client for it."""
         reg = _CSFakeRegistry()
         self.addCleanup(reg.close)
-        img = _cs_tiny_image(reg, workdir=workdir, user=user)
+        img = _cs_tiny_image(reg, workdir=workdir, user=user, env=env)
         return reg, img, containerstack.RegistryClient(reg.address, reg.repo, scheme='http')
 
     def test_containerstack_registry_token_flow(self):
@@ -1984,13 +1988,15 @@ class EasyBlockSpecificTest(TestCase):
             write_file(os.path.join(root, 'image.' + fmt), '')
         write_file(os.path.join(root, containerstack.ENROOT_NO_ENTRYPOINT), containerstack.ENROOT_NO_ENTRYPOINT_CONF)
         wrapper = os.path.join(root, 'bin', 'python')
-        write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64, 'python', 'auto', []))
-        adjust_permissions(wrapper, stat.S_IXUSR, add=True)
         # what a host Python module (e.g. Python 3.13 with packages) leaves in the caller's environment
         host = {'PYTHONPATH': '/host/lib/python3.13/site-packages', 'PYTHONHOME': '/host/python/3.13',
                 'PYTHONUSERBASE': '/home/u/.local', 'PYTHONNOUSERSITE': '1'}
 
         def run(runtime, image=None, site=None, caller=None):
+            # the wrapper as a build of this image renders it: with the image's ENV PYTHONPATH (None: it has none)
+            write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64, 'python', 'auto', [],
+                                                              image_pythonpath=(image or {}).get('PYTHONPATH')))
+            adjust_permissions(wrapper, stat.S_IXUSR, add=True)
             write_file(os.path.join(root, 'etc', 'site.env'), ''.join('%s=%s\n' % kv for kv in (site or {}).items()))
             write_file(os.path.join(fake, 'image-environment'),
                        ''.join('%s=%s\n' % kv for kv in (image or {}).items()))
@@ -2024,22 +2030,81 @@ class EasyBlockSpecificTest(TestCase):
                                    'PYTHONNOUSERSITE': '1'}, runtime)
 
     def test_containerstack_cs_pythonpath(self):
-        """CS_PYTHONPATH is the container's PYTHONPATH under every runtime: it replaces the image's ENV PYTHONPATH
-        (the host cannot add to it), and site.env beats it; the caller's own PYTHONPATH still stays out."""
+        """CS_PYTHONPATH goes first on the container's PYTHONPATH under every runtime, before the image's own ENV
+        PYTHONPATH (recorded at build time, kept verbatim); site.env beats both; the caller's PYTHONPATH stays out."""
         run = self._cs_python_env_runner()
         mine = {'CS_PYTHONPATH': '/home/u/Megatron-LM:/home/u/lib'}
+        # as in images that set ENV PYTHONPATH=/opt/NeMo-Framework-Launcher/launcher_scripts::/opt/megatron-lm,
+        # plus a space, a quote and a $ that must reach the container as they are
+        odd = "/opt/NeMo-Framework-Launcher/launcher_scripts::/opt/megatron-lm:/opt/my lib:/opt/it's$HOME"
         for runtime in ('sif', 'sqsh', 'pyxis'):
             self.assertEqual(run(runtime, caller=mine)['PYTHONPATH'], '/home/u/Megatron-LM:/home/u/lib', runtime)
             self.assertEqual(run(runtime, image={'PYTHONPATH': '/image/py'}, caller=mine)['PYTHONPATH'],
+                             '/home/u/Megatron-LM:/home/u/lib:/image/py', runtime)
+            self.assertEqual(run(runtime, image={'PYTHONPATH': odd}, caller=mine)['PYTHONPATH'],
+                             '/home/u/Megatron-LM:/home/u/lib:' + odd, runtime)
+            # an image whose ENV sets PYTHONPATH empty: nothing to add, no trailing ':'
+            self.assertEqual(run(runtime, image={'PYTHONPATH': ''}, caller=mine)['PYTHONPATH'],
                              '/home/u/Megatron-LM:/home/u/lib', runtime)
             self.assertEqual(run(runtime, image={'PYTHONPATH': '/image/py'}, site={'PYTHONPATH': '/site/py'},
                                  caller=mine)['PYTHONPATH'], '/site/py', runtime)
-            # empty: as if unset (the image's ENV applies)
-            self.assertEqual(run(runtime, image={'PYTHONPATH': '/image/py'}, caller={'CS_PYTHONPATH': ''})
-                             ['PYTHONPATH'], '/image/py', runtime)
+            # empty: as if unset (the image's ENV applies untouched)
+            for value in ('', None):
+                caller = {} if value is None else {'CS_PYTHONPATH': value}
+                self.assertEqual(run(runtime, image={'PYTHONPATH': odd}, caller=caller)['PYTHONPATH'], odd, runtime)
         # pyxis passes the name once, even when site.env sets it too
         self.assertEqual(run('pyxis', caller=mine)['container-env'], ',PYTHONPATH,')
         self.assertEqual(run('pyxis', site={'PYTHONPATH': '/site/py'}, caller=mine)['container-env'], ',PYTHONPATH,')
+
+    def test_containerstack_image_pythonpath(self):
+        """The build records the image's ENV PYTHONPATH (verbatim, or None) in manifest.json and renders it into the
+        wrappers, after CS_PYTHONPATH; a re-render without a build (--module-only) takes it from manifest.json."""
+        EasyBlock.sanity_check_step = lambda self, *args, **kwargs: None
+        self._cs_gpu(True)
+        fakebin = os.path.join(self.tmpdir, 'fakebin')
+        write_file(os.path.join(fakebin, 'apptainer'), '#!/bin/bash\necho "${APPTAINERENV_PYTHONPATH-unset}"\n')
+        adjust_permissions(os.path.join(fakebin, 'apptainer'), stat.S_IXUSR, add=True)
+
+        def container_pythonpath(eb):
+            res = subprocess.run([os.path.join(eb.installdir, 'bin', 'greet')], capture_output=True, text=True,
+                                 env={'PATH': fakebin + ':/usr/bin:/bin', 'CS_RUNTIME': 'sif',
+                                      'CS_PYTHONPATH': '/home/u/lib', 'CS_GPU_DEVICE': '/nonexistent'})
+            self.assertEqual((res.returncode, res.stderr), (0, ''))
+            return res.stdout[:-1]
+
+        odd = "/opt/launcher_scripts::/opt/megatron-lm:/opt/my lib:/opt/it's$HOME:/x=y"
+        for env, recorded in ((['PYTHONPATH=' + odd], odd), ([], None), (['PYTHONPATH='], ''),
+                              (['PYTHONPATH=/old', 'PYTHONPATH=/new'], '/new')):
+            eb, img = self._cs_easyblock(env=env)
+            with self.mocked_stdout_stderr():
+                eb.fetch_step()
+                eb.build_step()
+                eb.install_step()
+                eb.sanity_check_step()
+            manifest_path = os.path.join(eb.installdir, 'manifest.json')
+            self.assertEqual(json.loads(read_file(manifest_path))['image_pythonpath'], recorded, env)
+            expected = '/home/u/lib' + (':' + recorded if recorded else '')
+            self.assertEqual(container_pythonpath(eb), expected, env)
+            # --module-only: no build, so the value comes from manifest.json
+            eb, _ = self._cs_easyblock(env=env)
+            update_build_option('module_only', True)
+            os.remove(os.path.join(eb.installdir, 'bin', 'greet'))
+            eb.write_wrappers()
+            self.assertEqual(container_pythonpath(eb), expected, env)
+            update_build_option('module_only', False)
+        # an older manifest.json, without the key: as an image without PYTHONPATH
+        data = json.loads(read_file(manifest_path))
+        del data['image_pythonpath']
+        write_file(manifest_path, json.dumps(data))
+        eb, _ = self._cs_easyblock()
+        update_build_option('module_only', True)
+        eb.write_wrappers()
+        self.assertEqual(container_pythonpath(eb), '/home/u/lib')
+        # what the image config says: the last ENV PYTHONPATH, verbatim; None without one
+        for image_config, expected in (({'config': {'Env': ['PYTHONPATH=a::b c', 'X=1']}}, 'a::b c'),
+                                       ({'config': {'Env': ['PYTHONPATHX=1', 'MY_PYTHONPATH=2']}}, None),
+                                       ({'config': {'Env': None}}, None), ({'config': None}, None), ({}, None)):
+            self.assertEqual(containerstack.image_pythonpath(image_config), expected, image_config)
 
     def _cs_fake_run(self, cmd, **kwargs):
         """Stand-in for run_shell_cmd: records commands and fakes the files Apptainer/mksquashfs would make."""
@@ -2079,9 +2144,9 @@ class EasyBlockSpecificTest(TestCase):
         return RunShellCmdResult(cmd=cmd, exit_code=code, output=out, stderr=None, work_dir=None, out_file=None,
                                  err_file=None, cmd_sh=None, thread_id=None, task_id=None)
 
-    def _cs_easyblock(self, extra='', workdir='/work', user=None):
+    def _cs_easyblock(self, extra='', workdir='/work', user=None, env=()):
         """ContainerStack instance for the tiny image in a fake registry, with mocked commands and paths."""
-        reg, img, _ = self._cs_registry(workdir=workdir, user=user)
+        reg, img, _ = self._cs_registry(workdir=workdir, user=user, env=env)
         ec_file = os.path.join(self.tmpdir, 'tiny-container-1.0.eb')
         write_file(ec_file, textwrap.dedent("""
             easyblock = 'ContainerStack'
