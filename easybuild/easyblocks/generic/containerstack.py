@@ -284,17 +284,23 @@ class RegistryClient:
                                  "pin the per-architecture digests (RegistryClient.platform_digests)", digest)
         return data, media_type
 
-    def fetch_blob(self, digest, dest):
+    def fetch_blob(self, digest, dest, part=None):
         """
-        Stream blob digest to dest via dest.part, checking its sha256; nothing is left behind on mismatch.
-        dest.part is truncated: in a shared store, call this only while holding the blob's blob_lock().
+        Stream blob digest to dest via the file part (default dest.part), checking its sha256; nothing is left behind
+        on mismatch. dest.part is truncated: in a shared store, use it only while holding the blob's blob_lock(), and
+        pass a part of this run's own otherwise.
         """
-        part = dest + '.part'
+        part = part or dest + '.part'
         sha = hashlib.sha256()
-        with self._open('%s/blobs/%s' % (self.base, digest), '*/*') as resp, open(part, 'wb') as fh:
-            for chunk in iter(lambda: resp.read(CHUNK), b''):
-                sha.update(chunk)
-                fh.write(chunk)
+        try:
+            with self._open('%s/blobs/%s' % (self.base, digest), '*/*') as resp, open(part, 'wb') as fh:
+                for chunk in iter(lambda: resp.read(CHUNK), b''):
+                    sha.update(chunk)
+                    fh.write(chunk)
+        except BaseException:
+            if part != dest + '.part' and os.path.exists(part):    # a part of this run's own: nobody resumes it
+                os.remove(part)
+            raise
         got = 'sha256:' + sha.hexdigest()
         if got != digest:
             os.remove(part)
@@ -331,59 +337,125 @@ def verify_blob(path, digest):
     return file_sha256(path) == digest
 
 
+# blob_lock(): seconds between attempts at a lock another process holds, and between 'still waiting' messages
+LOCK_POLL_INTERVAL = 5
+LOCK_PROGRESS_INTERVAL = 60
+# errors that mean this user cannot open a lock file (another user's, a read-only store), and that the filesystem
+# cannot lock at all (e.g. NFSv3 without lockd)
+LOCK_DENIED = (errno.EACCES, errno.EPERM, errno.EROFS)
+LOCK_UNSUPPORTED = tuple(set((errno.ENOLCK, errno.EOPNOTSUPP, getattr(errno, 'ENOTSUP', errno.EOPNOTSUPP),
+                              errno.ENOSYS)))
+# lock directories already warned about as unusable, so that a store without locks gets one warning, not one per blob
+_UNLOCKED_STORES = set()
+
+
+def warn_unlocked(lock_dir, path, err):
+    """Warn (once per lock directory) that blobs are fetched without their lock."""
+    if lock_dir not in _UNLOCKED_STORES:
+        _UNLOCKED_STORES.add(lock_dir)
+        print_warning("ContainerStack: cannot lock %s (%s); fetching without locks: concurrent runs sharing this "
+                      "store are not serialised (every blob is still sha256-verified)" % (path, err))
+
+
 @contextlib.contextmanager
 def blob_lock(blobs_dir, digest):
     """
     Hold the exclusive lock on blob digest of the store blobs_dir, so that concurrent EasyBuild runs sharing the
     store (possibly on NFS) never write the same blob at once: a POSIX lock (fcntl.lockf, per process) on
     <blobs_dir>.locks/<hex>.lock, beside the store so that blobs_dir holds only blobs. Lock files are never removed
-    (removing one another run may be waiting on is racy).
+    (removing one another run may be waiting on is racy). Yields whether the lock is held.
+
+    A lock another process holds is tried again every LOCK_POLL_INTERVAL seconds, with a message naming the lock
+    file every LOCK_PROGRESS_INTERVAL seconds (so that a hung holder can be found); there is no timeout. Where the
+    lock cannot be had at all (a lock file or directory this user may not write; a filesystem without POSIX locks),
+    a warning says so once per store and this yields False: the caller then writes nothing another run may be
+    writing too (see fetch_blob), and every blob is still sha256-verified.
     """
     lock_dir = os.path.normpath(blobs_dir) + '.locks'
     path = blob_path(lock_dir, digest) + '.lock'
-    mkdir(lock_dir, parents=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
     try:
-        try:
-            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as err:
-            if err.errno not in (errno.EACCES, errno.EAGAIN):
-                raise EasyBuildError("ContainerStack: cannot lock %s: %s", path, err)
-            print_msg("ContainerStack: waiting for another EasyBuild run fetching blob %s (lock %s)" % (digest, path))
-            fcntl.lockf(fd, fcntl.LOCK_EX)
-        yield
+        os.makedirs(lock_dir, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    except OSError as err:
+        if err.errno not in LOCK_DENIED:
+            raise EasyBuildError("ContainerStack: cannot open lock file %s: %s", path, err)
+        warn_unlocked(lock_dir, path, err)
+        yield False
+        return
+    try:
+        locked, start, last = True, None, None
+        while True:
+            try:
+                fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as err:
+                if err.errno in LOCK_UNSUPPORTED:
+                    warn_unlocked(lock_dir, path, err)
+                    locked = False
+                    break
+                if err.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise EasyBuildError("ContainerStack: cannot lock %s: %s", path, err)
+            now = time.monotonic()
+            if start is None:
+                start = last = now
+                print_msg("ContainerStack: waiting for another EasyBuild run fetching blob %s (lock %s)"
+                          % (digest, path))
+            elif now - last >= LOCK_PROGRESS_INTERVAL:
+                last = now
+                print_msg("ContainerStack: still waiting after %d s for blob %s (lock %s)"
+                          % (now - start, digest, path))
+            time.sleep(LOCK_POLL_INTERVAL)
+        yield locked
     finally:
         os.close(fd)    # releases the lock
+
+
+def cached_blob(path, digest):
+    """True if the store has blob digest at path, verified."""
+    return os.path.isfile(path) and verify_blob(path, digest)
+
+
+def download_part(path, locked):
+    """File to download blob path to: path.part under the blob's lock, else one of this process' own."""
+    return path + '.part' if locked else '%s.part-%s-%d' % (path, socket.gethostname(), os.getpid())
 
 
 def fetch_oci_blobs(client, digest, blobs_dir):
     """
     Fetch manifest digest and the config and layers it references into blobs_dir, checking every sha256.
     Cached blobs are re-verified; corrupt or half-downloaded ones are fetched again. Returns the manifest.
-    Each blob is checked and fetched under its blob_lock(): a blob another run is fetching is waited for, then
-    reused. Only the lock holder writes a blob's .part file, so a .part found under the lock is stale.
+    A verified cached blob is used without taking any lock, so a read-only store works: blobs are only ever written
+    to a .part file then renamed into place, so a reader sees a whole blob or none. A blob that must be written is
+    checked again and fetched under its blob_lock(): one another run is fetching is waited for, then reused. Only
+    the lock holder writes a blob's .part file, so a .part found under the lock is stale; where locking is not
+    possible, a run downloads to a file of its own.
     """
     mkdir(blobs_dir, parents=True)
     path = blob_path(blobs_dir, digest)
-    with blob_lock(blobs_dir, digest):
-        if os.path.isfile(path) and verify_blob(path, digest):
-            with open(path, 'rb') as fh:
-                data = fh.read()
-        else:
-            data, _ = client.fetch_manifest(digest)
-            with open(path + '.part', 'wb') as fh:
-                fh.write(data)
-            os.replace(path + '.part', path)    # atomic: a reader sees the old file or the new one
+    data = None
+    if not cached_blob(path, digest):
+        with blob_lock(blobs_dir, digest) as locked:
+            if not cached_blob(path, digest):    # another run may have fetched it meanwhile
+                data, _ = client.fetch_manifest(digest)
+                part = download_part(path, locked)
+                with open(part, 'wb') as fh:
+                    fh.write(data)
+                os.replace(part, path)    # atomic: a reader sees the old file or the new one
+    if data is None:
+        with open(path, 'rb') as fh:
+            data = fh.read()
     manifest = json.loads(data.decode())
     for blob in [manifest['config']] + manifest['layers']:
         target = blob_path(blobs_dir, blob['digest'])
-        with blob_lock(blobs_dir, blob['digest']):
+        if cached_blob(target, blob['digest']):
+            continue
+        with blob_lock(blobs_dir, blob['digest']) as locked:
             if os.path.isfile(target):
                 if verify_blob(target, blob['digest']):
                     continue
                 print_warning("ContainerStack: cached blob %s is corrupt; fetching it again" % blob['digest'])
                 remove_file(target)
-            client.fetch_blob(blob['digest'], target)
+            client.fetch_blob(blob['digest'], target, part=download_part(target, locked))
     return manifest
 
 

@@ -29,6 +29,8 @@ Unit tests for specific easyblocks.
 """
 import base64
 import copy
+import errno
+import fcntl
 import gzip
 import hashlib
 import http.server
@@ -46,7 +48,7 @@ import textwrap
 import threading
 import time
 from pathlib import Path
-from unittest import TestLoader, TextTestRunner
+from unittest import TestLoader, TextTestRunner, mock
 from test.easyblocks.module import cleanup
 
 import easybuild.tools.options as eboptions
@@ -1281,6 +1283,94 @@ class EasyBlockSpecificTest(TestCase):
         before = len(reg.requests)
         containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
         self.assertEqual(reg.requests[before:], [])
+
+    def test_containerstack_fetch_read_only_cache(self):
+        """A read-only shared store holding a verified cache is used as is: no lock taken, no registry requests."""
+        if os.geteuid() == 0:
+            self.skipTest("root may write to read-only directories")
+        reg, img, client = self._cs_registry()
+        store = os.path.join(self.tmpdir, 'store')
+        blobs = os.path.join(store, 'sha256')
+        containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        remove_dir(blobs + '.locks')    # as in a store filled by the site, read-only for this user
+        for path in (blobs, store):
+            os.chmod(path, 0o555)
+        before = len(reg.requests)
+        with mock.patch.object(containerstack, 'blob_lock', side_effect=AssertionError("blob_lock() used")):
+            with self.mocked_stdout_stderr() as (stdout, stderr):
+                manifest = containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        self.assertEqual(manifest['config']['digest'], img['config'])
+        self.assertEqual(reg.requests[before:], [])
+        self.assertEqual(stdout.getvalue() + stderr.getvalue(), '')
+        self.assertFalse(os.path.exists(blobs + '.locks'))
+
+    def test_containerstack_fetch_unwritable_lock_files(self):
+        """Lock files this user cannot open (another user's): one warning, blobs fetched without the lock."""
+        if os.geteuid() == 0:
+            self.skipTest("root may open read-only files for writing")
+        reg, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        locks = blobs + '.locks'
+        for name in os.listdir(locks):
+            os.chmod(os.path.join(locks, name), 0o444)    # as another user's 0644 lock file
+        for digest in (img['config'], img['layer']):
+            os.remove(containerstack.blob_path(blobs, digest))
+        busy = containerstack.blob_path(blobs, img['layer']) + '.part'
+        write_file(busy, 'another run, also without the lock, is downloading this')
+        with self.mocked_stdout_stderr() as (stdout, stderr):
+            containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        output = stdout.getvalue() + stderr.getvalue()
+        self.assertEqual(output.count("concurrent runs sharing this store are not serialised"), 1, output)
+        self.assertIn("cannot lock %s" % locks, output)
+        containerstack.verify_oci_blobs(blobs, img['manifest'])
+        # without the lock, a download never writes (truncates, renames) the .part another run may be writing
+        self.assertEqual(read_file(busy), 'another run, also without the lock, is downloading this')
+        self.assertEqual(sorted(os.listdir(blobs)), sorted([os.path.basename(busy)] + [
+            d.split(':')[1] for d in (img['manifest'], img['config'], img['layer'])]))
+
+    def test_containerstack_fetch_without_lock_support(self):
+        """A filesystem without POSIX locks (e.g. NFSv3 without lockd): one warning, blobs fetched without locks."""
+        reg, img, client = self._cs_registry()
+        for code in (errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOSYS):
+            blobs = os.path.join(self.tmpdir, 'blobs-%s' % errno.errorcode[code])
+            with mock.patch.object(containerstack.fcntl, 'lockf', side_effect=OSError(code, os.strerror(code))):
+                with self.mocked_stdout_stderr() as (stdout, stderr):
+                    manifest = containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+            output = stdout.getvalue() + stderr.getvalue()
+            self.assertEqual(manifest['config']['digest'], img['config'])
+            self.assertEqual(output.count("concurrent runs sharing this store are not serialised"), 1, output)
+            self.assertIn("cannot lock %s.locks" % blobs, output)
+            containerstack.verify_oci_blobs(blobs, img['manifest'])
+
+    def test_containerstack_fetch_lock_wait_progress(self):
+        """A held blob lock is polled (never a blocking wait), with a progress line naming the lock file."""
+        _, img, client = self._cs_registry()
+        real_lockf = fcntl.lockf
+        for progress, expected in ((60, 0), (0, 3)):
+            blobs = os.path.join(self.tmpdir, 'blobs-%d' % progress)
+            calls = []
+
+            def lockf(fd, flags, *args):
+                calls.append(flags)
+                if len(calls) <= 4:    # the manifest's lock is held for 4 attempts
+                    raise OSError(errno.EAGAIN, os.strerror(errno.EAGAIN))
+                return real_lockf(fd, flags, *args)
+
+            with mock.patch.object(containerstack.fcntl, 'lockf', side_effect=lockf), \
+                    mock.patch.object(containerstack, 'LOCK_POLL_INTERVAL', 0), \
+                    mock.patch.object(containerstack, 'LOCK_PROGRESS_INTERVAL', progress):
+                with self.mocked_stdout_stderr() as (stdout, stderr):
+                    containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+            output = stdout.getvalue() + stderr.getvalue()
+            lock = containerstack.blob_path(blobs + '.locks', img['manifest']) + '.lock'
+            self.assertEqual(output.count("waiting for another EasyBuild run fetching blob %s (lock %s)"
+                                          % (img['manifest'], lock)), 1, output)
+            self.assertEqual(output.count("still waiting"), expected, output)
+            self.assertEqual(output.count("still waiting after"), output.count("lock %s" % lock) - 1, output)
+            self.assertEqual(len(calls), 7)    # 4 + 1 for the manifest, 1 each for config and layer
+            self.assertTrue(all(flags & fcntl.LOCK_NB for flags in calls), calls)
+            containerstack.verify_oci_blobs(blobs, img['manifest'])
 
     def test_containerstack_fetch_waits_for_concurrent_fetch(self):
         """A blob another process (eb run) holds the lock of is waited for, then reused, not downloaded again."""
