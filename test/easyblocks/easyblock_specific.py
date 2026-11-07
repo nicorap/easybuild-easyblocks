@@ -1317,12 +1317,14 @@ class EasyBlockSpecificTest(TestCase):
         fakebin = os.path.join(self.tmpdir, 'fakebin')
         for tool in ('srun', 'apptainer', 'enroot'):
             path = os.path.join(fakebin, tool)
+            # like Apptainer, the fake image sets OMP_NUM_THREADS itself: only APPTAINERENV_<NAME> overrides it
+            env = '${APPTAINERENV_OMP_NUM_THREADS:-image}' if tool == 'apptainer' else '$OMP_NUM_THREADS'
             write_file(path, '#!/bin/bash\necho "TOOL $(basename "$0")"\nfor a in "$@"; do echo "ARG $a"; done\n'
-                             'echo "ENV OMP_NUM_THREADS=$OMP_NUM_THREADS"\n')
+                             'echo "ENV OMP_NUM_THREADS=%s"\n' % env)
             adjust_permissions(path, stat.S_IXUSR, add=True)
         for fmt in ('sqsh', 'sif'):
             write_file(os.path.join(root, 'image.' + fmt), '')
-        write_file(os.path.join(root, 'etc', 'site.env'), 'OMP_NUM_THREADS=1\n')
+        write_file(os.path.join(root, 'etc', 'site.env'), '# site policy\n\nOMP_NUM_THREADS=1\n')
         wrapper = os.path.join(root, 'bin', 'greet')
         write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64,
                                                           "cat '/etc/my greeting'", 'auto', ['/data', '/x:/y']))
@@ -1337,17 +1339,21 @@ class EasyBlockSpecificTest(TestCase):
             return res.returncode, res.stdout.splitlines(), res.stderr
 
         # outside Slurm: Apptainer, binds normalised to src:dst, command words and user args intact, site env set
-        code, out, _ = run(args=['a b', "it's"])
+        # (beating the image's own ENV); comment and blank lines in site.env are skipped silently
+        code, out, err = run(args=['a b', "it's"])
         self.assertEqual(code, 0)
+        self.assertEqual(err, '')
         self.assertEqual(out, ['TOOL apptainer', 'ARG exec', 'ARG --bind', 'ARG /data:/data,/x:/y', 'ARG ' + sif,
                                'ARG cat', 'ARG /etc/my greeting', 'ARG a b', "ARG it's", 'ENV OMP_NUM_THREADS=1'])
-        # in an allocation but not in a step (batch script): pyxis via srun
-        code, out, _ = run({'SLURM_JOB_ID': '42'})
-        self.assertEqual(out, ['TOOL srun', 'ARG --container-image=' + sqsh, 'ARG --container-mounts=/data:/data,/x:/y',
-                               'ARG --container-env=OMP_NUM_THREADS', 'ARG cat', 'ARG /etc/my greeting',
-                               'ENV OMP_NUM_THREADS=1'])
+        # in an allocation but not in a step (batch script): pyxis via srun, one task like the plain command
+        code, out, err = run({'SLURM_JOB_ID': '42'})
+        self.assertEqual(err, '')
+        self.assertEqual(out, ['TOOL srun', 'ARG --nodes=1', 'ARG --ntasks=1', 'ARG --container-image=' + sqsh,
+                               'ARG --container-mounts=/data:/data,/x:/y', 'ARG --container-env=OMP_NUM_THREADS',
+                               'ARG cat', 'ARG /etc/my greeting', 'ENV OMP_NUM_THREADS=1'])
+        # CS_SRUN_ARGS comes after the defaults, so it wins (srun: the later option counts)
         code, out, _ = run({'SLURM_JOB_ID': '42', 'CS_SRUN_ARGS': '--ntasks-per-node=1 -N 2'})
-        self.assertEqual(out[1:4], ['ARG --ntasks-per-node=1', 'ARG -N', 'ARG 2'])
+        self.assertEqual(out[1:6], ['ARG --nodes=1', 'ARG --ntasks=1', 'ARG --ntasks-per-node=1', 'ARG -N', 'ARG 2'])
         # already inside a step: pyxis can no longer attach a container -> Apptainer, never a nested srun
         code, out, _ = run({'SLURM_JOB_ID': '42', 'SLURM_STEP_ID': '0'})
         self.assertEqual(out[0], 'TOOL apptainer')
@@ -1361,6 +1367,7 @@ class EasyBlockSpecificTest(TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out[:2], ['TOOL enroot', 'ARG start'])
         self.assertEqual(out[out.index('ARG --env') + 1], 'ARG OMP_NUM_THREADS')
+        self.assertFalse([a for a in out if '#' in a])
         self.assertIn('ARG /x:/y', out)
         self.assertIn('ARG cs-tiny-1.0-aaaaaaaaaaaa', out)
         # debug output, and an unknown runtime
