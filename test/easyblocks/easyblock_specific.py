@@ -1384,27 +1384,42 @@ class EasyBlockSpecificTest(TestCase):
         with open(source, 'wb') as fh:
             fh.write(reg.blobs[img['layer']])
         ready = os.path.join(self.tmpdir, 'child-has-lock')
-        # the other process: holds the blob's POSIX lock, downloads it (via its own .part) for a second, releases
+        waiting = os.path.join(self.tmpdir, 'parent-is-waiting')
+        # the other process: holds the blob's POSIX lock until this one says it waits for it (at most 30 s), then
+        # downloads the blob (via its own .part) and releases the lock
         child_code = textwrap.dedent("""
             import fcntl, os, shutil, sys, time
-            lock, source, target, ready = sys.argv[1:]
+            lock, source, target, ready, waiting = sys.argv[1:]
             fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o666)
             fcntl.lockf(fd, fcntl.LOCK_EX)
             open(ready, 'w').close()
-            time.sleep(1)
+            deadline = time.time() + 30
+            while not os.path.exists(waiting):
+                if time.time() > deadline:
+                    sys.exit("the other run never said it was waiting for the lock")
+                time.sleep(0.01)
             shutil.copyfile(source, target + '.part')
             os.rename(target + '.part', target)
             os.close(fd)
         """)
+        orig_print_msg = containerstack.print_msg
+
+        def print_msg(msg, *args, **kwargs):
+            orig_print_msg(msg, *args, **kwargs)
+            if 'waiting for another EasyBuild run' in msg:
+                write_file(waiting, '')
+
         target = containerstack.blob_path(blobs, img['layer'])
-        with subprocess.Popen([sys.executable, '-c', child_code, lock, source, target, ready]) as child:
-            for _ in range(200):
+        with subprocess.Popen([sys.executable, '-c', child_code, lock, source, target, ready, waiting]) as child:
+            for _ in range(600):
                 if os.path.exists(ready) or child.poll() is not None:
                     break
                 time.sleep(0.05)
             self.assertTrue(os.path.exists(ready), "child process never took the lock")
-            with self.mocked_stdout_stderr() as (stdout, stderr):
-                containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+            with mock.patch.object(containerstack, 'print_msg', print_msg), \
+                    mock.patch.object(containerstack, 'LOCK_POLL_INTERVAL', 0.05):
+                with self.mocked_stdout_stderr() as (stdout, stderr):
+                    containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
             self.assertEqual(child.wait(timeout=30), 0)
         output = stdout.getvalue() + stderr.getvalue()
         self.assertEqual([r for r in reg.blob_requests() if r.endswith(hexdigest)], [])
