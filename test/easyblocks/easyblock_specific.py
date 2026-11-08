@@ -71,6 +71,7 @@ from easybuild.tools.build_log import EasyBuildError
 from easybuild.tools.config import GENERAL_CLASS, build_option, get_module_syntax, update_build_option
 from easybuild.tools.environment import modify_env
 from easybuild.tools.filetools import adjust_permissions, mkdir, move_file, read_file, remove_dir, symlink, write_file
+from easybuild.tools.module_generator import ModuleGeneratorLua, ModuleGeneratorTcl
 from easybuild.tools.modules import modules_tool
 from easybuild.tools.options import set_tmpdir
 from easybuild.tools.run import RunShellCmdResult
@@ -2414,6 +2415,25 @@ class EasyBlockSpecificTest(TestCase):
                            ('TINYCONTAINER_SIF', os.path.join(eb.installdir, 'image.sif')),
                            ('TINYCONTAINER_DIGEST', img['manifest'])):
             self.assertTrue(re.search(r'%s.*%s' % (var, re.escape(value)), txt), (var, txt))
+
+    def test_containerstack_module_warns_host_python(self):
+        """Loaded over a host Python module, a module with python* launchers warns (on load only) of the shadowing."""
+        warning = ("WARNING: tiny-container/1.0: the container's python, python3 now shadow the host Python "
+                   "(EBROOTPYTHON is set); host Python packages are not visible inside the container")
+        expected = {
+            'Lua': 'if mode() == "load" and (os.getenv("EBROOTPYTHON") or "") ~= "" then\n'
+                   '    io.stderr:write([==[%s\n]==])\nend\n' % warning,
+            'Tcl': 'if { [ module-info mode load ] && [ info exists ::env(EBROOTPYTHON) ] && '
+                   '$::env(EBROOTPYTHON) ne "" } {\n    puts stderr "%s"\n}\n' % warning,
+        }
+        for launchers, warns in (("{'python': 'python', 'python3': 'python3', 'greet': 'cat /etc/greeting'}", True),
+                                 ("{'greet': 'cat /etc/greeting', 'pip': 'pip'}", False)):
+            eb, _ = self._cs_easyblock(extra="launchers = %s\n" % launchers)
+            for syntax, generator in (('Lua', ModuleGeneratorLua), ('Tcl', ModuleGeneratorTcl)):
+                eb.module_generator = generator(eb, fake=True)
+                txt = eb.make_module_extra()
+                self.assertEqual(expected[syntax] in txt, warns, (syntax, launchers, txt))
+                self.assertEqual('shadow' in txt, warns, (syntax, launchers, txt))
 
 
 def suite(loader):

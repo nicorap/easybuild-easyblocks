@@ -32,6 +32,7 @@ import base64
 import contextlib
 import errno
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
@@ -878,6 +879,8 @@ class ContainerStack(EasyBlock):
     and site_env still set them. PYTHONUSERBASE and PYTHONNOUSERSITE are passed on as before: the user site is
     per Python version (lib/pythonX.Y), it is the user's own choice, and dropping PYTHONUSERBASE would only send the
     container's Python to ~/.local (mounted with $HOME by default); PYTHONNOUSERSITE=1 is the switch that hides it.
+    A module with launchers named python* prints a one-line warning when it is loaded while a host Python module is
+    (EBROOTPYTHON is set): its python now shadows the host's, whose packages the container cannot see.
 
     An image's User (config.User, e.g. '1000:1000' or 'appuser') is ignored, as 'enroot import' ignores it (enroot
     4.2.0's docker::configure, src/docker.sh, never reads it) and as `apptainer exec` does: under every runtime the
@@ -1182,4 +1185,23 @@ class ContainerStack(EasyBlock):
             txt += self.module_generator.set_environment('%s_%s' % (prefix, fmt.upper()),
                                                          os.path.join(self.installdir, 'image.' + fmt))
         txt += self.module_generator.set_environment(prefix + '_DIGEST', self.digest)
+        txt += self._host_python_warning()
         return txt
+
+    def _host_python_warning(self):
+        """
+        Module code that, on load only, warns when a host Python module is loaded (EBROOTPYTHON is set) and python*
+        launchers of this module now come first on $PATH: their Python is the container's, which cannot see the host
+        Python's packages (and the wrappers do not pass the host's PYTHONPATH in). '' without python* launchers.
+        """
+        names = sorted(name for name in self.cfg['launchers'] if fnmatch.fnmatchcase(name, 'python*'))
+        if not names:
+            return ''
+        msg = ("WARNING: %s: the container's %s now shadow%s the host Python (EBROOTPYTHON is set); host Python "
+               "packages are not visible inside the container"
+               % (self.short_mod_name, ', '.join(names), '' if len(names) > 1 else 's'))
+        if self.module_generator.SYNTAX == 'Lua':
+            return ('\nif mode() == "load" and (os.getenv("EBROOTPYTHON") or "") ~= "" then\n'
+                    '    io.stderr:write([==[%s\n]==])\nend\n' % msg)
+        return ('\nif { [ module-info mode load ] && [ info exists ::env(EBROOTPYTHON) ] && '
+                '$::env(EBROOTPYTHON) ne "" } {\n    puts stderr "%s"\n}\n' % msg)
