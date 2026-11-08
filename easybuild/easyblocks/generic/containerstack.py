@@ -43,6 +43,7 @@ import socket
 import stat
 import subprocess
 import tarfile
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -417,8 +418,18 @@ def cached_blob(path, digest):
 
 
 def download_part(path, locked):
-    """File to download blob path to: path.part under the blob's lock, else one of this process' own."""
-    return path + '.part' if locked else '%s.part-%s-%d' % (path, socket.gethostname(), os.getpid())
+    """
+    File to download blob path to: path.part under the blob's lock, else a new file of this run's own (mkstemp,
+    path.part-<random>, which no other run's file can be), made as readable as a plain new file (mkstemp's are 0600).
+    """
+    if locked:
+        return path + '.part'
+    fd, part = tempfile.mkstemp(dir=os.path.dirname(path), prefix=os.path.basename(path) + '.part-')
+    try:
+        os.fchmod(fd, 0o666 & ~current_umask())
+    finally:
+        os.close(fd)
+    return part
 
 
 @contextlib.contextmanager
@@ -451,11 +462,16 @@ def fetch_oci_blobs(client, digest, blobs_dir):
         with blob_lock(blobs_dir, digest) as locked:
             if not cached_blob(path, digest):    # another run may have fetched it meanwhile
                 data, _ = client.fetch_manifest(digest)
-                part = download_part(path, locked)
                 with store_writes(blobs_dir, digest):
-                    with open(part, 'wb') as fh:
-                        fh.write(data)
-                    os.replace(part, path)    # atomic: a reader sees the old file or the new one
+                    part = download_part(path, locked)
+                    try:
+                        with open(part, 'wb') as fh:
+                            fh.write(data)
+                        os.replace(part, path)    # atomic: a reader sees the old file or the new one
+                    except BaseException:
+                        if os.path.exists(part):
+                            os.remove(part)
+                        raise
     if data is None:
         with open(path, 'rb') as fh:
             data = fh.read()

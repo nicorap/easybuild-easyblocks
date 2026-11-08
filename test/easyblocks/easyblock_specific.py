@@ -1324,6 +1324,68 @@ class EasyBlockSpecificTest(TestCase):
                                        containerstack.fetch_oci_blobs, client, img['manifest'], blobs)
             self.assertEqual(len(os.listdir(blobs)), 2)
 
+    def test_containerstack_fetch_lockless_part_files(self):
+        """Without locks, blobs and manifest go through new part files of this run's own: removed when interrupted;
+        part files other runs left (whatever their name and content) are never used, renamed or removed."""
+        reg, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        hexes = dict((kind, img[kind].split(':')[1]) for kind in ('manifest', 'config', 'layer'))
+        # what other runs left: an intact copy of the layer, junk, and the names this process' pid once gave
+        foreign = {hexes['layer'] + '.part-otherhost-1': reg.blobs[img['layer']],
+                   hexes['config'] + '.part-otherhost-2': b'junk'}
+        for kind in ('manifest', 'layer'):
+            foreign['%s.part-%s-%d' % (hexes[kind], containerstack.socket.gethostname(), os.getpid())] = b'stale'
+        mkdir(blobs, parents=True)
+        for name, data in foreign.items():
+            with open(os.path.join(blobs, name), 'wb') as fh:
+                fh.write(data)
+        real_open, real_replace = client._open, os.replace
+
+        def open_interrupted(url, accept):
+            """The layer's download stops (Ctrl-C) after its first bytes."""
+            resp = real_open(url, accept)
+            if not url.endswith(img['layer']):
+                return resp
+            first = resp.read(10)
+            resp.close()
+            fake = mock.MagicMock()
+            fake.__enter__.return_value = fake
+            fake.read.side_effect = [first, KeyboardInterrupt()]
+            return fake
+
+        def replace_interrupted(src, dst):
+            """Ctrl-C once the manifest's part file is written."""
+            if os.path.basename(dst) == hexes['manifest']:
+                raise KeyboardInterrupt
+            return real_replace(src, dst)
+
+        def listing():
+            return dict((name, read_file(os.path.join(blobs, name), mode='rb')) for name in os.listdir(blobs))
+
+        nolock = OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+        with mock.patch.object(containerstack.fcntl, 'lockf', side_effect=nolock):
+            with self.mocked_stdout_stderr():
+                with mock.patch.object(containerstack.os, 'replace', side_effect=replace_interrupted):
+                    self.assertRaises(KeyboardInterrupt, containerstack.fetch_oci_blobs, client, img['manifest'],
+                                      blobs)
+                self.assertEqual(listing(), foreign)
+                with mock.patch.object(client, '_open', side_effect=open_interrupted):
+                    self.assertRaises(KeyboardInterrupt, containerstack.fetch_oci_blobs, client, img['manifest'],
+                                      blobs)
+                self.assertEqual(set(listing()), set(foreign) | {hexes['manifest'], hexes['config']})
+                before = len(reg.blob_requests())
+                containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        # the intact foreign copy of the layer was not trusted: downloaded again; the others' files are as they were
+        self.assertEqual([r for r in reg.blob_requests()[before:] if r.endswith(hexes['layer'])],
+                         ['/v2/%s/blobs/%s' % (reg.repo, img['layer'])])
+        containerstack.verify_oci_blobs(blobs, img['manifest'])
+        self.assertEqual(listing(), dict(foreign, **dict((hexes[kind], reg.blobs.get(img[kind]) or
+                                                          reg.manifests[img[kind]][0]) for kind in hexes)))
+        # blobs are as readable as a plain file this user writes (a private 0600 temporary file would not be)
+        for kind in hexes:
+            mode = stat.S_IMODE(os.stat(os.path.join(blobs, hexes[kind])).st_mode)
+            self.assertEqual(mode, 0o666 & ~containerstack.current_umask(), kind)
+
     def test_containerstack_fetch_unwritable_lock_files(self):
         """Lock files this user cannot open (another user's): one warning, blobs fetched without the lock."""
         if os.geteuid() == 0:
