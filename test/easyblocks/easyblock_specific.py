@@ -1305,6 +1305,25 @@ class EasyBlockSpecificTest(TestCase):
         self.assertEqual(stdout.getvalue() + stderr.getvalue(), '')
         self.assertFalse(os.path.exists(blobs + '.locks'))
 
+    def test_containerstack_fetch_read_only_store_missing_blob(self):
+        """A read-only store missing a blob: an error naming blob and store, not a raw PermissionError."""
+        if os.geteuid() == 0:
+            self.skipTest("root may write to read-only directories")
+        _, img, client = self._cs_registry()
+        for missing in ('layer', 'manifest'):
+            store = os.path.join(self.tmpdir, 'store-' + missing)
+            blobs = os.path.join(store, 'sha256')
+            containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+            os.remove(containerstack.blob_path(blobs, img[missing]))
+            remove_dir(blobs + '.locks')    # as in a store filled by the site, read-only for this user
+            for path in (blobs, store):
+                os.chmod(path, 0o555)
+            with self.mocked_stdout_stderr():
+                self.assertRaisesRegex(EasyBuildError, "blob %s is missing from read-only store %s; populate it from "
+                                       "a run that can write there" % (img[missing], re.escape(blobs)),
+                                       containerstack.fetch_oci_blobs, client, img['manifest'], blobs)
+            self.assertEqual(len(os.listdir(blobs)), 2)
+
     def test_containerstack_fetch_unwritable_lock_files(self):
         """Lock files this user cannot open (another user's): one warning, blobs fetched without the lock."""
         if os.geteuid() == 0:
