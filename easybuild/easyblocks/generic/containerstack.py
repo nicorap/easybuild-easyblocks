@@ -434,14 +434,17 @@ def download_part(path, locked):
 
 @contextlib.contextmanager
 def store_writes(blobs_dir, digest):
-    """Turn a store this user may not write to (errno in LOCK_DENIED) into an error saying blob digest is missing."""
+    """
+    Turn a write into the store this user may not make (errno in LOCK_DENIED: a read-only store, another user's
+    .part file) into an error saying blob digest is missing or corrupt there.
+    """
     try:
         yield
     except OSError as err:
         if err.errno not in LOCK_DENIED:
             raise
-        raise EasyBuildError("ContainerStack: blob %s is missing from read-only store %s; populate it from a run "
-                             "that can write there (%s)", digest, blobs_dir, err)
+        raise EasyBuildError("ContainerStack: cannot write to blob store %s (%s); blob %s is missing or corrupt there; "
+                             "populate it from a run that can write there", blobs_dir, err.strerror, digest)
 
 
 def fetch_oci_blobs(client, digest, blobs_dir):
@@ -452,8 +455,8 @@ def fetch_oci_blobs(client, digest, blobs_dir):
     to a .part file then renamed into place, so a reader sees a whole blob or none. A blob that must be written is
     checked again and fetched under its blob_lock(): one another run is fetching is waited for, then reused. Only
     the lock holder writes a blob's .part file, so a .part found under the lock is stale; where locking is not
-    possible, a run downloads to a file of its own. A blob missing from a store this user cannot write to (a
-    read-only site store) is an error saying so.
+    possible, a run downloads to a file of its own. A blob missing or corrupt in a store this user cannot write to (a
+    read-only site store), or whose .part file is another user's, is an error saying so (store_writes).
     """
     mkdir(blobs_dir, parents=True)
     path = blob_path(blobs_dir, digest)
@@ -485,7 +488,8 @@ def fetch_oci_blobs(client, digest, blobs_dir):
                 if verify_blob(target, blob['digest']):
                     continue
                 print_warning("ContainerStack: cached blob %s is corrupt; fetching it again" % blob['digest'])
-                remove_file(target)
+                with store_writes(blobs_dir, blob['digest']):
+                    os.remove(target)
             with store_writes(blobs_dir, blob['digest']):
                 client.fetch_blob(blob['digest'], target, part=download_part(target, locked))
     return manifest

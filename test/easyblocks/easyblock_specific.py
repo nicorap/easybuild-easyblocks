@@ -115,6 +115,11 @@ sed -e '/^[[:alpha:]_][[:alnum:]_]*=/!d' -e '/^ENROOT_/d' "$ENROOT_ENVIRON" |
 '''
 
 
+# the error for a blob a run cannot write into the store: (store, digest)
+CS_STORE_UNWRITABLE = (r"cannot write to blob store %s \(Permission denied\); blob %s is missing or corrupt there; "
+                       "populate it from a run that can write there")
+
+
 class _CSFakeRegistry:
     """Minimal OCI distribution API on 127.0.0.1 (bearer token, manifests, blobs) for ContainerStack tests."""
 
@@ -1319,10 +1324,46 @@ class EasyBlockSpecificTest(TestCase):
             for path in (blobs, store):
                 os.chmod(path, 0o555)
             with self.mocked_stdout_stderr():
-                self.assertRaisesRegex(EasyBuildError, "blob %s is missing from read-only store %s; populate it from "
-                                       "a run that can write there" % (img[missing], re.escape(blobs)),
+                self.assertRaisesRegex(EasyBuildError, CS_STORE_UNWRITABLE % (re.escape(blobs), img[missing]),
                                        containerstack.fetch_oci_blobs, client, img['manifest'], blobs)
             self.assertEqual(len(os.listdir(blobs)), 2)
+
+    def test_containerstack_fetch_read_only_store_corrupt_blob(self):
+        """A corrupt blob in a read-only store: the same error, not a failure to remove it."""
+        if os.geteuid() == 0:
+            self.skipTest("root may write to read-only directories")
+        _, img, client = self._cs_registry()
+        for corrupt in ('layer', 'config', 'manifest'):
+            store = os.path.join(self.tmpdir, 'store-' + corrupt)
+            blobs = os.path.join(store, 'sha256')
+            containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+            path = containerstack.blob_path(blobs, img[corrupt])
+            data = read_file(path, mode='rb')
+            with open(path, 'wb') as fh:
+                fh.write(data[:-1] + bytes([data[-1] ^ 0xff]))
+            remove_dir(blobs + '.locks')    # as in a store filled by the site, read-only for this user
+            for path in (blobs, store):
+                os.chmod(path, 0o555)
+            with self.mocked_stdout_stderr():
+                self.assertRaisesRegex(EasyBuildError, CS_STORE_UNWRITABLE % (re.escape(blobs), img[corrupt]),
+                                       containerstack.fetch_oci_blobs, client, img['manifest'], blobs)
+            self.assertEqual(len(os.listdir(blobs)), 3)
+
+    def test_containerstack_fetch_unwritable_part_file(self):
+        """A .part file this user cannot write (another user's) in a writable store: an error naming store and blob."""
+        if os.geteuid() == 0:
+            self.skipTest("root may open read-only files for writing")
+        _, img, client = self._cs_registry()
+        for missing in ('layer', 'manifest'):
+            blobs = os.path.join(self.tmpdir, 'blobs-' + missing)
+            containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+            path = containerstack.blob_path(blobs, img[missing])
+            os.remove(path)
+            write_file(path + '.part', 'left by another user')
+            os.chmod(path + '.part', 0o444)    # as another user's 0644 file
+            with self.mocked_stdout_stderr():
+                self.assertRaisesRegex(EasyBuildError, CS_STORE_UNWRITABLE % (re.escape(blobs), img[missing]),
+                                       containerstack.fetch_oci_blobs, client, img['manifest'], blobs)
 
     def test_containerstack_fetch_lockless_part_files(self):
         """Without locks, blobs and manifest go through new part files of this run's own: removed when interrupted;
