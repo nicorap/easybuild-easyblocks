@@ -2109,6 +2109,44 @@ class EasyBlockSpecificTest(TestCase):
                                    containerstack.image_entries, blobs, [_cs_layer(blobs, dangling, zstd=bool(zstd))],
                                    paths)
 
+    def test_containerstack_hard_link_resolution(self):
+        """Hard links resolve alike in gzip, native zstd and zstd-command layers: absolute targets, to symlinks."""
+        blobs = os.path.join(self.tmpdir, 'blobs')
+
+        def members():
+            return [_cs_member('etc/real', b'real\n'),
+                    _cs_member('etc/hosts', kind=tarfile.LNKTYPE, mode=0o640, linkname='/etc/real'),
+                    _cs_member('etc/sym', kind=tarfile.SYMTYPE, linkname='real'),
+                    _cs_member('etc/abssym', kind=tarfile.SYMTYPE, linkname='/etc/real'),
+                    _cs_member('etc/resolv.conf', kind=tarfile.LNKTYPE, linkname='etc/sym'),
+                    _cs_member('etc/abs', kind=tarfile.LNKTYPE, linkname='./etc/abssym'),
+                    _cs_member('etc/real', b'real, archived later\n')]
+        paths = ('etc/hosts', 'etc/resolv.conf', 'etc/abs')
+        kinds = [False] + (['native', 'command'] if shutil.which('zstd') else [])
+        for zstd in kinds:
+            if zstd == 'command':
+                self._cs_without_zstd_tarfile()
+            elif zstd == 'native' and not containerstack.tarfile_reads_zstd():
+                continue
+            layer = _cs_layer(blobs, members(), zstd=bool(zstd))
+            orig_open_layer = containerstack.open_layer
+            with mock.patch.object(containerstack, 'open_layer', side_effect=orig_open_layer) as opened:
+                found = containerstack.image_entries(blobs, [layer], paths)
+            # an absolute target is an image path ('/etc/real' is etc/real), the last such member before the link;
+            # a hard link to a symlink reads what the symlink points to, as tarfile does: relative to the symlink's
+            # directory (an absolute target: from the image root), the last member of that name in the whole layer
+            self.assertEqual([found[p][1] for p in paths], [b'real\n', b'real, archived later\n',
+                                                            b'real, archived later\n'], zstd)
+            self.assertTrue(found['etc/hosts'][0].islnk())
+            self.assertEqual(found['etc/hosts'][0].mode, 0o640)
+            self.assertEqual(opened.call_count, 2 if zstd == 'command' else 1, zstd)
+            # a symlink loop never resolves
+            loop = _cs_layer(blobs, [_cs_member('etc/a', kind=tarfile.SYMTYPE, linkname='b'),
+                                     _cs_member('etc/b', kind=tarfile.SYMTYPE, linkname='a'),
+                                     _cs_member('etc/hosts', kind=tarfile.LNKTYPE, linkname='etc/a')], zstd=bool(zstd))
+            self.assertRaisesRegex(EasyBuildError, "hard link etc/hosts .* links to etc/a, which is not a file",
+                                   containerstack.image_entries, blobs, [loop], paths)
+
     def test_containerstack_fixperms(self):
         """enroot's fixperms: chmod -R u+rX, then u+w on directories as deep as enroot's find reaches them."""
         root = os.path.join(self.tmpdir, 'rootfs')

@@ -550,34 +550,55 @@ def hard_link_error(layer, path, link):
                           "that layer", path, layer['digest'], layer_path(link.linkname))
 
 
-def hard_link_data(blobs_dir, layer, links, index):
+# hard_link_member(): links (hard or symbolic) followed at most, as the kernel's limit on nested symlinks
+LINK_FOLLOW_MAX = 40
+
+
+def hard_link_member(layer, path, link, index):
     """
-    {path: data} for the hard links 'links' ({path: TarInfo}) of a layer streamed through the 'zstd' command, which
-    cannot seek back to the member a link names. index ({name: [(offset, hard link target or None, is a file)]},
-    every member of the layer in order) resolves each link as tarfile does: to the last member of that name before
-    it, following a hard link to a hard link (each step goes to an earlier member, so this ends). The data is read
-    in a second pass over the layer, keeping only those members.
+    The file member whose data hard link 'link' (the member for image path 'path') has, in a layer whose members are
+    index ({image path: [TarInfo, ...]}, in layer order). The one resolver for every kind of layer, with names and
+    targets normalised by layer_path ('./etc/a' and '/etc/a' are etc/a), as tarfile reads a link from a seekable
+    tar: a hard link is the last member of its target's name before it, a symlink the last member of the name it
+    points to in the whole layer; links are followed in turn, at most LINK_FOLLOW_MAX of them (a symlink loop never
+    ends). So a hard link to a symlink has the data of the file the symlink points to, relative to the symlink's
+    directory or, for an absolute target, to the image root (tarfile would join that to the directory too).
     """
-    targets = {}
-    for path, link in links.items():
-        name, before = layer_path(link.linkname), link.offset
-        while True:
-            earlier = [entry for entry in index.get(name, []) if entry[0] < before]
-            if not earlier:
-                raise hard_link_error(layer, path, link)
-            before, linkname, isfile = earlier[-1]
-            if linkname is None:
-                if not isfile:
-                    raise hard_link_error(layer, path, link)
-                targets.setdefault(before, []).append(path)
-                break
-            name = layer_path(linkname)
+    member = link
+    for _ in range(LINK_FOLLOW_MAX):
+        if member.islnk():
+            name, before = layer_path(member.linkname), member.offset
+        else:
+            target = member.linkname
+            if not target.startswith('/'):
+                target = os.path.join(os.path.dirname(layer_path(member.name)), target)
+            name, before = layer_path(target), None
+        candidates = [entry for entry in index.get(name, []) if before is None or entry.offset < before]
+        if not candidates:
+            break
+        member = candidates[-1]
+        if member.isfile():
+            return member
+        if not (member.islnk() or member.issym()):
+            break
+    raise hard_link_error(layer, path, link)
+
+
+def hard_link_data(blobs_dir, layer, targets):
+    """
+    {path: data} for the hard links of a layer streamed through the 'zstd' command, which cannot seek back to the
+    member a link resolves to: targets is {path: that file member (hard_link_member)}. The data is read in a second
+    pass over the layer, keeping only those members.
+    """
+    wanted = {}
+    for path, member in targets.items():
+        wanted.setdefault(member.offset, []).append(path)
     data = {}
     with open_layer(blobs_dir, layer) as tar:
         for member in tar:
-            if member.offset in targets:
+            if member.offset in wanted:
                 content = tar.extractfile(member).read()
-                data.update((path, content) for path in targets[member.offset])
+                data.update((path, content) for path in wanted[member.offset])
     return data
 
 
@@ -590,20 +611,20 @@ def image_entries(blobs_dir, layers, paths):
     """
     For each image path in 'paths': (TarInfo, bytes or None) of its final entry once all layers are applied
     in order (OCI whiteouts and opaque directories included), or None if the image does not have it.
-    A hard link's bytes are those of the member it links to (through any chain of hard links), as tarfile reads them.
+    A hard link's bytes are those of the file it resolves to (hard_link_member, the same for every kind of layer):
+    a seekable layer reads that member where it is (tarfile seeks back), a layer streamed through the 'zstd' command
+    in a second pass.
     """
     found = dict((path, None) for path in paths)
     for layer in layers:
         streamed = layer_is_streamed(layer)
         # gone: (path, whether the path itself goes too) for what this layer hides of the lower layers
-        # links, index: for a streamed layer, the wanted hard links and every member, for a second pass
-        entries, gone, links, index = {}, [], {}, {}
+        # links: the wanted hard links; index: every member of the layer, by image path, to resolve them
+        entries, gone, links, index, targets = {}, [], {}, {}, {}
         with open_layer(blobs_dir, layer) as tar:
             for member in tar:
                 name = layer_path(member.name)
-                if streamed:
-                    index.setdefault(name, []).append(
-                        (member.offset, member.linkname if member.islnk() else None, member.isfile()))
+                index.setdefault(name, []).append(member)
                 parent, base = os.path.split(name)
                 if base == '.wh..wh..opq':
                     gone.append((parent, False))
@@ -617,19 +638,15 @@ def image_entries(blobs_dir, layers, paths):
                         data = None
                         if member.isfile():
                             data = tar.extractfile(member).read()
-                        elif member.islnk() and streamed:
+                        elif member.islnk():
                             links[name] = member
-                        elif member.islnk():    # tarfile seeks back to the member it links to
-                            try:
-                                fh = tar.extractfile(member)
-                            except KeyError:    # no member of that name before it
-                                fh = None
-                            if fh is None:    # or not a file
-                                raise hard_link_error(layer, name, member)
-                            data = fh.read()
                         entries[name] = (member, data)
-        if links:
-            for path, data in hard_link_data(blobs_dir, layer, links, index).items():
+            targets = dict((path, hard_link_member(layer, path, link, index)) for path, link in links.items())
+            if not streamed:
+                for path, target in targets.items():
+                    entries[path] = (entries[path][0], tar.extractfile(target).read())
+        if streamed and targets:
+            for path, data in hard_link_data(blobs_dir, layer, targets).items():
                 entries[path] = (entries[path][0], data)
         for path in found:
             if any(not g or path.startswith(g + '/') or (itself and path == g) for g, itself in gone):
