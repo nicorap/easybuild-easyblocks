@@ -816,6 +816,8 @@ WRAPPER_TEMPLATE = r'''#!/bin/bash
 # No runtime gets the caller's PYTHONPATH or PYTHONHOME: they name a host Python's paths (e.g. a loaded Python module's
 # site-packages), which the container's Python cannot use and which are not mounted; image ENV and site.env still set
 # them. PYTHONUSERBASE and PYTHONNOUSERSITE go in (the user site is per Python version; the default is in $HOME).
+# CS_PYTHONPATH (paths as the container sees them, e.g. CS_PYTHONPATH=$HOME/Megatron-LM) is the container's PYTHONPATH
+# under every runtime: it replaces the image's ENV PYTHONPATH (append that yourself if needed); site.env beats it.
 root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)" || exit 1
 sqsh="$root/image.sqsh"
 sif="$root/image.sif"
@@ -824,6 +826,11 @@ mounts=(%(mounts)s)
 cmd=(%(cmd)s)
 names=()
 unset PYTHONPATH PYTHONHOME
+if [ -n "${CS_PYTHONPATH:-}" ]; then
+    # forwarded by name, like site.env, so that it beats image ENV; before site.env, which beats it
+    export PYTHONPATH="$CS_PYTHONPATH" APPTAINERENV_PYTHONPATH="$CS_PYTHONPATH"
+    names+=(PYTHONPATH)
+fi
 if [ -r "$root/etc/site.env" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
         # only NAME=VALUE lines; comments, blank lines and anything else are skipped
@@ -832,7 +839,7 @@ if [ -r "$root/etc/site.env" ]; then
         case "$name" in '' | [0-9]* | *[!A-Za-z0-9_]*) continue ;; esac
         # Apptainer lets image ENV beat host env; APPTAINERENV_<NAME> beats image ENV
         export "$line" "APPTAINERENV_$line"
-        names+=("$name")
+        case " ${names[*]} " in *" $name "*) ;; *) names+=("$name") ;; esac
     done < "$root/etc/site.env"
 fi
 runtime="${CS_RUNTIME:-%(policy)s}"
@@ -935,7 +942,11 @@ class ContainerStack(EasyBlock):
     No runtime gets the caller's PYTHONPATH or PYTHONHOME (the wrappers unset them before anything else): with a host
     Python module loaded they name that interpreter's site-packages, built for another Python version and not mounted
     in the container, so the container's Python would silently miss them or mix them with its own. The image's ENV
-    and site_env still set them. PYTHONUSERBASE and PYTHONNOUSERSITE are passed on as before: the user site is
+    and site_env still set them. To put paths of one's own on the container's PYTHONPATH (e.g. a Megatron-LM
+    checkout in $HOME), set CS_PYTHONPATH: the wrappers pass it in as PYTHONPATH by name, as site_env is passed
+    (pyxis --container-env, APPTAINERENV_PYTHONPATH, enroot --env), so under every runtime it replaces the image's
+    ENV PYTHONPATH (the host cannot read the image's value to add to it: include it in CS_PYTHONPATH if needed) and
+    site_env's PYTHONPATH beats it. PYTHONUSERBASE and PYTHONNOUSERSITE are passed on as before: the user site is
     per Python version (lib/pythonX.Y), it is the user's own choice, and dropping PYTHONUSERBASE would only send the
     container's Python to ~/.local (mounted with $HOME by default); PYTHONNOUSERSITE=1 is the switch that hides it.
     A module with launchers named python* prints a one-line warning when it is loaded while a host Python module is
@@ -1261,7 +1272,7 @@ class ContainerStack(EasyBlock):
         if not names:
             return ''
         msg = ("WARNING: %s: the container's %s now shadow%s the host Python (EBROOTPYTHON is set); host Python "
-               "packages are not visible inside the container"
+               "packages are not visible inside the container; set CS_PYTHONPATH to pass paths into the container"
                % (self.short_mod_name, ', '.join(names), '' if len(names) > 1 else 's'))
         if self.module_generator.SYNTAX == 'Lua':
             return ('\nif mode() == "load" and (os.getenv("EBROOTPYTHON") or "") ~= "" then\n'

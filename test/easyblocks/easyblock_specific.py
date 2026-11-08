@@ -1844,8 +1844,13 @@ class EasyBlockSpecificTest(TestCase):
                                'CS_RUNTIME': 'sqsh', 'CS_GPU_DEVICE': '/nonexistent',
                                'HF_HUB_OFFLINE': '1', 'NCCL_DEBUG': 'INFO', 'SPACED': ' a  b ', 'EMPTY': ''})
 
-    def test_containerstack_python_env_isolation(self):
-        """The caller's PYTHONPATH and PYTHONHOME never reach the container; image ENV and site.env still do."""
+    def _cs_python_env_runner(self):
+        """
+        A python wrapper with fake apptainer, srun and enroot that each print the value their runtime gives
+        PYTHONPATH, PYTHONHOME, PYTHONUSERBASE and PYTHONNOUSERSITE in the container (and srun its --container-env).
+        Returns run(runtime, image=None, site=None, caller=None) -> {name: value, 'container-env': ...}; the caller's
+        environment is a host Python module's (overridden by caller), image the image's ENV, site etc/site.env.
+        """
         root, fake = os.path.join(self.tmpdir, 'install'), os.path.join(self.tmpdir, 'fake-enroot')
         fakebin = os.path.join(self.tmpdir, 'fakebin')
         names = ('PYTHONPATH', 'PYTHONHOME', 'PYTHONUSERBASE', 'PYTHONNOUSERSITE')
@@ -1857,7 +1862,8 @@ class EasyBlockSpecificTest(TestCase):
             '    if [ -n "${!a+set}" ]; then v=${!a}; elif [ -n "${!i+set}" ]; then v=${!i}; else v=${!n-unset}; fi\n'
         )))
         write_file(os.path.join(fakebin, 'srun'), '#!/bin/bash\ncenv=,\nfor a in "$@"; do\n'
-                   '    case "$a" in --container-env=*) cenv=",${a#--container-env=},";; esac\ndone\n' +
+                   '    case "$a" in --container-env=*) cenv=",${a#--container-env=},";; esac\ndone\n'
+                   'echo "IN container-env=$cenv"\n' +
                    loop % (' '.join(names), (
                        '    if [[ $cenv != *,$n,* ]] && [ -n "${!i+set}" ]; then v=${!i}; else v=${!n-unset}; fi\n')))
         write_file(os.path.join(fakebin, 'enroot'), CS_FAKE_ENROOT.replace('@DIR@', fake))
@@ -1873,12 +1879,13 @@ class EasyBlockSpecificTest(TestCase):
         host = {'PYTHONPATH': '/host/lib/python3.13/site-packages', 'PYTHONHOME': '/host/python/3.13',
                 'PYTHONUSERBASE': '/home/u/.local', 'PYTHONNOUSERSITE': '1'}
 
-        def run(runtime, image=None, site=None):
+        def run(runtime, image=None, site=None, caller=None):
             write_file(os.path.join(root, 'etc', 'site.env'), ''.join('%s=%s\n' % kv for kv in (site or {}).items()))
             write_file(os.path.join(fake, 'image-environment'),
                        ''.join('%s=%s\n' % kv for kv in (image or {}).items()))
             env = dict(host, PATH=fakebin + ':/usr/bin:/bin', CS_GPU_DEVICE='/nonexistent', CS_RUNTIME=runtime,
                        SLURM_JOB_ID='42')
+            env.update(caller or {})
             env.update(('IMAGE_' + k, v) for k, v in (image or {}).items())
             res = subprocess.run([wrapper, '-c', 'pass'], env=env, capture_output=True, text=True)
             self.assertEqual((res.returncode, res.stderr), (0, ''), runtime)
@@ -1887,15 +1894,41 @@ class EasyBlockSpecificTest(TestCase):
                 return dict((n, got.get(n, 'unset')) for n in names)
             return dict(line[3:].split('=', 1) for line in res.stdout.splitlines() if line.startswith('IN '))
 
+        return run
+
+    def test_containerstack_python_env_isolation(self):
+        """The caller's PYTHONPATH and PYTHONHOME never reach the container; image ENV and site.env still do."""
+        run = self._cs_python_env_runner()
         for runtime in ('sif', 'sqsh', 'pyxis'):
             # host interpreter paths mean nothing in the image: gone; the user-site settings go in as before
-            self.assertEqual(run(runtime), {'PYTHONPATH': 'unset', 'PYTHONHOME': 'unset',
-                                            'PYTHONUSERBASE': '/home/u/.local', 'PYTHONNOUSERSITE': '1'}, runtime)
+            got = run(runtime)
+            got.pop('container-env', None)
+            self.assertEqual(got, {'PYTHONPATH': 'unset', 'PYTHONHOME': 'unset',
+                                   'PYTHONUSERBASE': '/home/u/.local', 'PYTHONNOUSERSITE': '1'}, runtime)
             # the image's own ENV PYTHONPATH still applies, and site_env beats it
             self.assertEqual(run(runtime, image={'PYTHONPATH': '/image/py'})['PYTHONPATH'], '/image/py', runtime)
-            self.assertEqual(run(runtime, image={'PYTHONPATH': '/image/py'}, site={'PYTHONPATH': '/site/py'}),
-                             {'PYTHONPATH': '/site/py', 'PYTHONHOME': 'unset', 'PYTHONUSERBASE': '/home/u/.local',
-                              'PYTHONNOUSERSITE': '1'}, runtime)
+            got = run(runtime, image={'PYTHONPATH': '/image/py'}, site={'PYTHONPATH': '/site/py'})
+            got.pop('container-env', None)
+            self.assertEqual(got, {'PYTHONPATH': '/site/py', 'PYTHONHOME': 'unset', 'PYTHONUSERBASE': '/home/u/.local',
+                                   'PYTHONNOUSERSITE': '1'}, runtime)
+
+    def test_containerstack_cs_pythonpath(self):
+        """CS_PYTHONPATH is the container's PYTHONPATH under every runtime: it replaces the image's ENV PYTHONPATH
+        (the host cannot add to it), and site.env beats it; the caller's own PYTHONPATH still stays out."""
+        run = self._cs_python_env_runner()
+        mine = {'CS_PYTHONPATH': '/home/u/Megatron-LM:/home/u/lib'}
+        for runtime in ('sif', 'sqsh', 'pyxis'):
+            self.assertEqual(run(runtime, caller=mine)['PYTHONPATH'], '/home/u/Megatron-LM:/home/u/lib', runtime)
+            self.assertEqual(run(runtime, image={'PYTHONPATH': '/image/py'}, caller=mine)['PYTHONPATH'],
+                             '/home/u/Megatron-LM:/home/u/lib', runtime)
+            self.assertEqual(run(runtime, image={'PYTHONPATH': '/image/py'}, site={'PYTHONPATH': '/site/py'},
+                                 caller=mine)['PYTHONPATH'], '/site/py', runtime)
+            # empty: as if unset (the image's ENV applies)
+            self.assertEqual(run(runtime, image={'PYTHONPATH': '/image/py'}, caller={'CS_PYTHONPATH': ''})
+                             ['PYTHONPATH'], '/image/py', runtime)
+        # pyxis passes the name once, even when site.env sets it too
+        self.assertEqual(run('pyxis', caller=mine)['container-env'], ',PYTHONPATH,')
+        self.assertEqual(run('pyxis', site={'PYTHONPATH': '/site/py'}, caller=mine)['container-env'], ',PYTHONPATH,')
 
     def _cs_fake_run(self, cmd, **kwargs):
         """Stand-in for run_shell_cmd: records commands and fakes the files Apptainer/mksquashfs would make."""
@@ -2572,7 +2605,8 @@ class EasyBlockSpecificTest(TestCase):
     def test_containerstack_module_warns_host_python(self):
         """Loaded over a host Python module, a module with python* launchers warns (on load only) of the shadowing."""
         warning = ("WARNING: tiny-container/1.0: the container's python, python3 now shadow the host Python "
-                   "(EBROOTPYTHON is set); host Python packages are not visible inside the container")
+                   "(EBROOTPYTHON is set); host Python packages are not visible inside the container; set "
+                   "CS_PYTHONPATH to pass paths into the container")
         expected = {
             'Lua': 'if mode() == "load" and (os.getenv("EBROOTPYTHON") or "") ~= "" then\n'
                    '    io.stderr:write([==[%s\n]==])\nend\n' % warning,
