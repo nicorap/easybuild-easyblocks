@@ -201,7 +201,7 @@ class _CSFakeRegistry:
         return [r for r in self.requests if '/blobs/' in r]
 
 
-def _cs_tiny_image(registry, tag='1.0', workdir='/work'):
+def _cs_tiny_image(registry, tag='1.0', workdir='/work', user=None):
     """Push a one-layer image (file etc/greeting) and a multi-arch index to the fake registry; return digests."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode='w:gz') as tar:
@@ -213,9 +213,11 @@ def _cs_tiny_image(registry, tag='1.0', workdir='/work'):
         info.type, info.mode = tarfile.DIRTYPE, 0o555
         tar.addfile(info)
     layer = buf.getvalue()
-    config = json.dumps({'architecture': 'amd64', 'os': 'linux', 'rootfs': {'type': 'layers', 'diff_ids': []},
-                         'config': {'Env': ['PATH=/usr/bin:/bin', 'GREETING=hello world'], 'Cmd': ['sh'],
-                                    'WorkingDir': workdir}}).encode()
+    config = {'architecture': 'amd64', 'os': 'linux', 'rootfs': {'type': 'layers', 'diff_ids': []},
+              'config': {'Env': ['PATH=/usr/bin:/bin', 'GREETING=hello world'], 'Cmd': ['sh'], 'WorkingDir': workdir}}
+    if user is not None:
+        config['config']['User'] = user
+    config = json.dumps(config).encode()
     layer_digest = registry.add_blob(layer)
     config_digest = registry.add_blob(config)
     manifest = {'schemaVersion': 2, 'mediaType': CS_OCI_MANIFEST,
@@ -1177,11 +1179,11 @@ class EasyBlockSpecificTest(TestCase):
         self.assertEqual(containerstack.env_var_prefix('PyTorch-container'), 'PYTORCHCONTAINER')
         self.assertEqual(containerstack.env_var_prefix('vLLM-container'), 'VLLMCONTAINER')
 
-    def _cs_registry(self, workdir='/work'):
+    def _cs_registry(self, workdir='/work', user=None):
         """Fake registry with the tiny image, and a client for it."""
         reg = _CSFakeRegistry()
         self.addCleanup(reg.close)
-        img = _cs_tiny_image(reg, workdir=workdir)
+        img = _cs_tiny_image(reg, workdir=workdir, user=user)
         return reg, img, containerstack.RegistryClient(reg.address, reg.repo, scheme='http')
 
     def test_containerstack_registry_token_flow(self):
@@ -1659,9 +1661,9 @@ class EasyBlockSpecificTest(TestCase):
         return RunShellCmdResult(cmd=cmd, exit_code=code, output=out, stderr=None, work_dir=None, out_file=None,
                                  err_file=None, cmd_sh=None, thread_id=None, task_id=None)
 
-    def _cs_easyblock(self, extra='', workdir='/work'):
+    def _cs_easyblock(self, extra='', workdir='/work', user=None):
         """ContainerStack instance for the tiny image in a fake registry, with mocked commands and paths."""
-        reg, img, _ = self._cs_registry(workdir=workdir)
+        reg, img, _ = self._cs_registry(workdir=workdir, user=user)
         ec_file = os.path.join(self.tmpdir, 'tiny-container-1.0.eb')
         write_file(ec_file, textwrap.dedent("""
             easyblock = 'ContainerStack'
@@ -1737,6 +1739,35 @@ class EasyBlockSpecificTest(TestCase):
         eb.fetch_step()
         eb.build_step()
         self.assertEqual([c for c in self.cs_calls if 'mksquashfs' in c or '--sandbox' in c], [])
+
+    def test_containerstack_non_root_user(self):
+        """A non-root image User is ignored as enroot import ignores it, with a build warning and in manifest.json."""
+        EasyBlock.sanity_check_step = lambda self, *args, **kwargs: None
+        self._cs_gpu(True)
+        etc = {}
+        for user in (None, 'root', '0:0', '1000:1000', 'appuser'):
+            eb, _ = self._cs_easyblock(user=user)
+            with self.mocked_stdout_stderr() as (stdout, stderr):
+                eb.fetch_step()
+                eb.build_step()
+                eb.install_step()
+                eb.sanity_check_step()
+            output = stdout.getvalue() + stderr.getvalue()
+            warning = ("image sets User %r, which enroot and Apptainer ignore: the container runs as the calling user"
+                       % user)
+            self.assertEqual(warning in output, user in ('1000:1000', 'appuser'), (user, output))
+            manifest = json.loads(read_file(os.path.join(eb.installdir, 'manifest.json')))
+            self.assertEqual(manifest['image_user'], user)
+            etc[user] = (self.cs_squashed['rc'].split('\n', 1)[1], self.cs_squashed['environment'])
+        # the .sqsh's /etc files do not depend on User, as with enroot import (docker::configure never reads it)
+        self.assertEqual(len(set(etc.values())), 1, etc)
+        casedir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'containerstack_enroot', 'nginx')
+        config = json.loads(read_file(os.path.join(casedir, 'config.json')))
+        config['config']['User'] = '101:101'
+        files = containerstack.enroot_files(config, 'p')
+        for rel in ('etc/environment', 'etc/fstab', 'etc/rc.local'):
+            self.assertEqual(files[rel], read_file(os.path.join(casedir, os.path.basename(rel))), rel)
+        self.assertEqual(files['etc/rc'].split('\n', 1)[1], read_file(os.path.join(casedir, 'rc')).split('\n', 1)[1])
 
     def test_containerstack_image_entries(self):
         """image_entries applies layers in order, with OCI whiteouts and opaque directories."""

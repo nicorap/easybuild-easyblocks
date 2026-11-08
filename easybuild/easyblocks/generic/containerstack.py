@@ -445,6 +445,18 @@ def enroot_files(image_config, provenance):
     return {'etc/fstab': fstab, 'etc/environment': environment, 'etc/rc': rc, 'etc/rc.local': ENROOT_RC_LOCAL}
 
 
+def read_image_config(blobs_dir, manifest):
+    """The image config (a dict) of a verified manifest."""
+    with open(blob_path(blobs_dir, manifest['config']['digest']), 'rb') as fh:
+        return json.loads(fh.read().decode())
+
+
+def image_user(image_config):
+    """The User the image config names (None if unset), and whether that is a user other than root."""
+    user = (image_config.get('config') or {}).get('User') or None
+    return user, bool(user) and user.split(':', 1)[0] not in ('', '0', 'root')
+
+
 def image_entries(blobs_dir, layers, paths):
     """
     For each image path in 'paths': (TarInfo, bytes or None) of its final entry once all layers are applied
@@ -706,6 +718,10 @@ class ContainerStack(EasyBlock):
     SHELL, USER, LOGNAME, TERM (enroot sets them for the container's user), nor a value containing a newline (enroot's
     environment file has one variable per line).
 
+    An image's User (config.User, e.g. '1000:1000' or 'appuser') is ignored, as 'enroot import' ignores it (enroot
+    4.2.0's docker::configure never reads it) and as `apptainer exec` does: under every runtime the container runs as
+    the calling user. The build warns about a non-root User, and manifest.json records it as image_user.
+
     Promotion (`eb --module-only` with hidden = False) must not use --force: EasyBuild then skips the sanity check,
     and with it the check that the install's manifest.json matches the pinned digest.
     """
@@ -795,6 +811,11 @@ class ContainerStack(EasyBlock):
     def build_step(self):
         """Build the requested formats from the verified OCI layout, inside the build directory."""
         self.manifest = verify_oci_blobs(self.blobs_dir, self.digest)
+        user, non_root = image_user(read_image_config(self.blobs_dir, self.manifest))
+        if non_root:
+            print_warning("ContainerStack: image sets User %r, which enroot and Apptainer ignore: the container runs "
+                          "as the calling user (as with enroot import and apptainer exec), not as %s" % (user, user),
+                          log=self.log)
         need = sum(layer['size'] for layer in self.manifest['layers']) * self.cfg['min_free_space_factor']
         free = disk_free(self.builddir)
         if free < need:
@@ -829,8 +850,7 @@ class ContainerStack(EasyBlock):
                 os.chmod(path, entry[0].mode & 0o7777)
         enroot_fixperms(rootfs)
         os.chmod(rootfs, 0o777 & ~current_umask())
-        with open(blob_path(self.blobs_dir, self.manifest['config']['digest']), 'rb') as fh:
-            config = json.loads(fh.read().decode())
+        config = read_image_config(self.blobs_dir, self.manifest)
         provenance = 'containerstack://%s@%s' % (self.cfg['image'], self.digest)
         for rel, text in enroot_files(config, provenance).items():
             path = rootfs_path(rootfs, rel)
@@ -931,6 +951,7 @@ class ContainerStack(EasyBlock):
             'name': self.name, 'version': self.version, 'image': self.cfg['image'],
             'registry': self.registry, 'repository': self.repo, 'arch': self.arch_key, 'digest': self.digest,
             'config_digest': self.manifest['config']['digest'],
+            'image_user': image_user(read_image_config(self.blobs_dir, self.manifest))[0],
             'layers': [layer['digest'] for layer in self.manifest['layers']],
             'files': files, 'runtimes': self.runtime_versions(), 'smoke_tests': results,
             'easybuild': str(EASYBUILD_VERSION), 'easyblocks': str(EASYBLOCKS_VERSION),
