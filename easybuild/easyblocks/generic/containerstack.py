@@ -30,6 +30,8 @@ in enroot/pyxis (.sqsh) and Apptainer (.sif) formats.
 """
 import base64
 import contextlib
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -48,7 +50,7 @@ import urllib.request
 from easybuild.easyblocks import VERSION as EASYBLOCKS_VERSION
 from easybuild.framework.easyblock import EasyBlock
 from easybuild.framework.easyconfig import CUSTOM
-from easybuild.tools.build_log import EasyBuildError, print_warning
+from easybuild.tools.build_log import EasyBuildError, print_msg, print_warning
 from easybuild.tools.config import IGNORE, build_option, log_path, source_paths
 from easybuild.tools.filetools import adjust_permissions, copy_file, mkdir, read_file, remove_dir, remove_file
 from easybuild.tools.filetools import symlink, which, write_file
@@ -283,7 +285,10 @@ class RegistryClient:
         return data, media_type
 
     def fetch_blob(self, digest, dest):
-        """Stream blob digest to dest via dest.part, checking its sha256; nothing is left behind on mismatch."""
+        """
+        Stream blob digest to dest via dest.part, checking its sha256; nothing is left behind on mismatch.
+        dest.part is truncated: in a shared store, call this only while holding the blob's blob_lock().
+        """
         part = dest + '.part'
         sha = hashlib.sha256()
         with self._open('%s/blobs/%s' % (self.base, digest), '*/*') as resp, open(part, 'wb') as fh:
@@ -294,7 +299,7 @@ class RegistryClient:
         if got != digest:
             os.remove(part)
             raise EasyBuildError("ContainerStack: blob %s downloaded with sha256 %s; refusing it", digest, got)
-        os.rename(part, dest)
+        os.replace(part, dest)
 
     def platform_digests(self, ref):
         """Per-architecture manifest digests ({'x86_64': ..., 'aarch64': ...}) of the multi-arch index ref."""
@@ -326,29 +331,59 @@ def verify_blob(path, digest):
     return file_sha256(path) == digest
 
 
+@contextlib.contextmanager
+def blob_lock(blobs_dir, digest):
+    """
+    Hold the exclusive lock on blob digest of the store blobs_dir, so that concurrent EasyBuild runs sharing the
+    store (possibly on NFS) never write the same blob at once: a POSIX lock (fcntl.lockf, per process) on
+    <blobs_dir>.locks/<hex>.lock, beside the store so that blobs_dir holds only blobs. Lock files are never removed
+    (removing one another run may be waiting on is racy).
+    """
+    lock_dir = os.path.normpath(blobs_dir) + '.locks'
+    path = blob_path(lock_dir, digest) + '.lock'
+    mkdir(lock_dir, parents=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as err:
+            if err.errno not in (errno.EACCES, errno.EAGAIN):
+                raise EasyBuildError("ContainerStack: cannot lock %s: %s", path, err)
+            print_msg("ContainerStack: waiting for another EasyBuild run fetching blob %s (lock %s)" % (digest, path))
+            fcntl.lockf(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)    # releases the lock
+
+
 def fetch_oci_blobs(client, digest, blobs_dir):
     """
     Fetch manifest digest and the config and layers it references into blobs_dir, checking every sha256.
     Cached blobs are re-verified; corrupt or half-downloaded ones are fetched again. Returns the manifest.
+    Each blob is checked and fetched under its blob_lock(): a blob another run is fetching is waited for, then
+    reused. Only the lock holder writes a blob's .part file, so a .part found under the lock is stale.
     """
     mkdir(blobs_dir, parents=True)
     path = blob_path(blobs_dir, digest)
-    if os.path.isfile(path) and verify_blob(path, digest):
-        with open(path, 'rb') as fh:
-            data = fh.read()
-    else:
-        data, _ = client.fetch_manifest(digest)
-        with open(path, 'wb') as fh:
-            fh.write(data)
+    with blob_lock(blobs_dir, digest):
+        if os.path.isfile(path) and verify_blob(path, digest):
+            with open(path, 'rb') as fh:
+                data = fh.read()
+        else:
+            data, _ = client.fetch_manifest(digest)
+            with open(path + '.part', 'wb') as fh:
+                fh.write(data)
+            os.replace(path + '.part', path)    # atomic: a reader sees the old file or the new one
     manifest = json.loads(data.decode())
     for blob in [manifest['config']] + manifest['layers']:
         target = blob_path(blobs_dir, blob['digest'])
-        if os.path.isfile(target):
-            if verify_blob(target, blob['digest']):
-                continue
-            print_warning("ContainerStack: cached blob %s is corrupt; fetching it again" % blob['digest'])
-            remove_file(target)
-        client.fetch_blob(blob['digest'], target)
+        with blob_lock(blobs_dir, blob['digest']):
+            if os.path.isfile(target):
+                if verify_blob(target, blob['digest']):
+                    continue
+                print_warning("ContainerStack: cached blob %s is corrupt; fetching it again" % blob['digest'])
+                remove_file(target)
+            client.fetch_blob(blob['digest'], target)
     return manifest
 
 

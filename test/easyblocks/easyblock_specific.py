@@ -44,6 +44,7 @@ import tarfile
 import tempfile
 import textwrap
 import threading
+import time
 from pathlib import Path
 from unittest import TestLoader, TextTestRunner
 from test.easyblocks.module import cleanup
@@ -1278,6 +1279,61 @@ class EasyBlockSpecificTest(TestCase):
         before = len(reg.requests)
         containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
         self.assertEqual(reg.requests[before:], [])
+
+    def test_containerstack_fetch_waits_for_concurrent_fetch(self):
+        """A blob another process (eb run) holds the lock of is waited for, then reused, not downloaded again."""
+        reg, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        hexdigest = img['layer'].split(':')[1]
+        lock = os.path.join(self.tmpdir, 'blobs.locks', hexdigest + '.lock')
+        mkdir(os.path.dirname(lock), parents=True)
+        mkdir(blobs, parents=True)
+        source = os.path.join(self.tmpdir, 'layer-bytes')
+        with open(source, 'wb') as fh:
+            fh.write(reg.blobs[img['layer']])
+        ready = os.path.join(self.tmpdir, 'child-has-lock')
+        # the other process: holds the blob's POSIX lock, downloads it (via its own .part) for a second, releases
+        child_code = textwrap.dedent("""
+            import fcntl, os, shutil, sys, time
+            lock, source, target, ready = sys.argv[1:]
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o666)
+            fcntl.lockf(fd, fcntl.LOCK_EX)
+            open(ready, 'w').close()
+            time.sleep(1)
+            shutil.copyfile(source, target + '.part')
+            os.rename(target + '.part', target)
+            os.close(fd)
+        """)
+        target = containerstack.blob_path(blobs, img['layer'])
+        with subprocess.Popen([sys.executable, '-c', child_code, lock, source, target, ready]) as child:
+            for _ in range(200):
+                if os.path.exists(ready) or child.poll() is not None:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(os.path.exists(ready), "child process never took the lock")
+            with self.mocked_stdout_stderr() as (stdout, stderr):
+                containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+            self.assertEqual(child.wait(timeout=30), 0)
+        output = stdout.getvalue() + stderr.getvalue()
+        self.assertEqual([r for r in reg.blob_requests() if r.endswith(hexdigest)], [])
+        self.assertEqual(output.count("waiting for another EasyBuild run fetching blob %s" % img['layer']), 1,
+                         output)
+        containerstack.verify_oci_blobs(blobs, img['manifest'])
+        self.assertEqual(sorted(os.listdir(blobs)),
+                         sorted(d.split(':')[1] for d in (img['manifest'], img['config'], img['layer'])))
+
+    def test_containerstack_manifest_written_atomically(self):
+        """The cached manifest is replaced as a new file, never rewritten in place (a reader sees old or new)."""
+        _, img, client = self._cs_registry()
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        path = containerstack.blob_path(blobs, img['manifest'])
+        write_file(path, 'stale manifest from an interrupted run')
+        reader = os.path.join(self.tmpdir, 'reader-view')
+        os.link(path, reader)    # what a process that opened the old file sees
+        containerstack.fetch_oci_blobs(client, img['manifest'], blobs)
+        self.assertEqual(read_file(reader), 'stale manifest from an interrupted run')
+        self.assertTrue(containerstack.verify_blob(path, img['manifest']))
+        self.assertFalse(os.path.exists(path + '.part'))
 
     def test_containerstack_corrupt_cache_refetched(self):
         """Corrupt, missing or half-downloaded cached blobs are detected and fetched again, never trusted."""
