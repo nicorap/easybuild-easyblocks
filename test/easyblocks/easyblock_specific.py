@@ -2324,12 +2324,33 @@ class EasyBlockSpecificTest(TestCase):
             self.assertTrue(found['etc/hosts'][0].islnk())
             self.assertEqual(found['etc/hosts'][0].mode, 0o640)
             self.assertEqual(opened.call_count, 2 if zstd == 'command' else 1, zstd)
-            # a symlink loop never resolves
-            loop = _cs_layer(blobs, [_cs_member('etc/a', kind=tarfile.SYMTYPE, linkname='b'),
-                                     _cs_member('etc/b', kind=tarfile.SYMTYPE, linkname='a'),
-                                     _cs_member('etc/hosts', kind=tarfile.LNKTYPE, linkname='etc/a')], zstd=bool(zstd))
-            self.assertRaisesRegex(EasyBuildError, "hard link etc/hosts .* links to etc/a, which is not a file",
-                                   containerstack.image_entries, blobs, [loop], paths)
+
+    def test_containerstack_hard_link_symlink_loop(self):
+        """A hard link through a symlink loop, or through more links than the kernel follows, says so."""
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        too_many = "hard link etc/hosts: too many levels of symbolic links \\(loop or > 40\\) in layer sha256:"
+        loop = _cs_layer(blobs, [_cs_member('etc/a', kind=tarfile.SYMTYPE, linkname='b'),
+                                 _cs_member('etc/b', kind=tarfile.SYMTYPE, linkname='a'),
+                                 _cs_member('etc/hosts', kind=tarfile.LNKTYPE, linkname='etc/a')])
+        self.assertRaisesRegex(EasyBuildError, too_many, containerstack.image_entries, blobs, [loop], ['etc/hosts'])
+
+        def chain(links):
+            """etc/hosts: a hard link to etc/s1, a symlink to s2, ... to s<links - 1>, a symlink to the file etc/real"""
+            members = [_cs_member('etc/real', b'real\n')]
+            members += [_cs_member('etc/s%d' % i, kind=tarfile.SYMTYPE, linkname='s%d' % (i + 1))
+                        for i in range(1, links - 1)]
+            members += [_cs_member('etc/s%d' % (links - 1), kind=tarfile.SYMTYPE, linkname='real'),
+                        _cs_member('etc/hosts', kind=tarfile.LNKTYPE, linkname='etc/s1')]
+            return containerstack.image_entries(blobs, [_cs_layer(blobs, members)], ['etc/hosts'])
+
+        # the hard link and 39 symlinks are 40 links: followed; one more is too many
+        self.assertEqual(chain(40)['etc/hosts'][1], b'real\n')
+        self.assertRaisesRegex(EasyBuildError, too_many, chain, 41)
+        # a link to nothing is still that
+        dangling = _cs_layer(blobs, [_cs_member('etc/a', kind=tarfile.SYMTYPE, linkname='nowhere'),
+                                     _cs_member('etc/hosts', kind=tarfile.LNKTYPE, linkname='etc/a')])
+        self.assertRaisesRegex(EasyBuildError, "hard link etc/hosts .* links to etc/a, which is not a file",
+                               containerstack.image_entries, blobs, [dangling], ['etc/hosts'])
 
     def test_containerstack_fixperms(self):
         """enroot's fixperms: chmod -R u+rX, then u+w on directories as deep as enroot's find reaches them."""

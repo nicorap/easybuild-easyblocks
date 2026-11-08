@@ -592,8 +592,9 @@ def hard_link_member(layer, path, link, index):
     targets normalised by layer_path ('./etc/a' and '/etc/a' are etc/a), as tarfile reads a link from a seekable
     tar: a hard link is the last member of its target's name before it, a symlink the last member of the name it
     points to in the whole layer; links are followed in turn, at most LINK_FOLLOW_MAX of them (a symlink loop never
-    ends). So a hard link to a symlink has the data of the file the symlink points to, relative to the symlink's
-    directory or, for an absolute target, to the image root (tarfile would join that to the directory too).
+    ends: more is an error saying so, like ELOOP). So a hard link to a symlink has the data of the file the symlink
+    points to, relative to the symlink's directory or, for an absolute target, to the image root (tarfile would join
+    that to the directory too).
     """
     member = link
     for _ in range(LINK_FOLLOW_MAX):
@@ -612,6 +613,9 @@ def hard_link_member(layer, path, link, index):
             return member
         if not (member.islnk() or member.issym()):
             break
+    else:
+        raise EasyBuildError("ContainerStack: hard link %s: too many levels of symbolic links (loop or > %d) in "
+                             "layer %s", path, LINK_FOLLOW_MAX, layer['digest'])
     raise hard_link_error(layer, path, link)
 
 
