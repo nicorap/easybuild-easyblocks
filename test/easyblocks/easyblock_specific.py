@@ -1619,6 +1619,40 @@ class EasyBlockSpecificTest(TestCase):
                              env={'PATH': fakebin + ':/usr/bin:/bin', 'CS_GPU_DEVICE': '/nonexistent'})
         self.assertEqual(res.stdout.splitlines()[:5], ['TOOL apptainer', 'ARG exec', 'ARG ' + sif, 'ARG sh', 'ARG -c'])
 
+    def test_containerstack_pyxis_inside_step(self):
+        """CS_RUNTIME=pyxis inside a job step fails at once: a nested srun would wait for this step's resources."""
+        root, fakebin = os.path.join(self.tmpdir, 'install'), os.path.join(self.tmpdir, 'fakebin')
+        called = os.path.join(self.tmpdir, 'srun-called')
+        # a nested srun in a step that holds the allocation waits ('Requested nodes are busy') until the job ends
+        write_file(os.path.join(fakebin, 'srun'), '#!/bin/bash\ntouch "%s"\nsleep 30\n' % called)
+        write_file(os.path.join(fakebin, 'apptainer'), '#!/bin/bash\necho apptainer\n')
+        for tool in ('srun', 'apptainer'):
+            adjust_permissions(os.path.join(fakebin, tool), stat.S_IXUSR, add=True)
+        for fmt in ('sqsh', 'sif'):
+            write_file(os.path.join(root, 'image.' + fmt), '')
+        wrapper = os.path.join(root, 'bin', 'python')
+        write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64, 'python', 'auto', []))
+        adjust_permissions(wrapper, stat.S_IXUSR, add=True)
+
+        def run(env):
+            env = dict(env, PATH=fakebin + ':/usr/bin:/bin', CS_GPU_DEVICE='/nonexistent')
+            start = time.monotonic()
+            res = subprocess.run([wrapper, '-c', 'pass'], env=env, capture_output=True, text=True, timeout=60)
+            return res.returncode, res.stdout, res.stderr, time.monotonic() - start
+
+        code, out, err, seconds = run({'SLURM_JOB_ID': '42', 'SLURM_STEP_ID': '3', 'CS_RUNTIME': 'pyxis'})
+        self.assertEqual((code, out), (1, ''))
+        self.assertEqual(err, "ContainerStack: CS_RUNTIME=pyxis, but already inside job step 3 of job 42; a nested "
+                              "srun would wait for resources held by this step: use CS_RUNTIME=sif or sqsh here, or "
+                              "call the launcher from the batch script\n")
+        self.assertFalse(os.path.exists(called))
+        self.assertLess(seconds, 5)
+        # auto inside a step is unchanged (Apptainer); pyxis outside a step (batch script) still runs srun
+        self.assertEqual(run({'SLURM_JOB_ID': '42', 'SLURM_STEP_ID': '3'})[:2], (0, 'apptainer\n'))
+        self.assertFalse(os.path.exists(called))
+        write_file(os.path.join(fakebin, 'srun'), '#!/bin/bash\necho srun\n')
+        self.assertEqual(run({'SLURM_JOB_ID': '42', 'CS_RUNTIME': 'pyxis'})[:3], (0, 'srun\n', ''))
+
     def test_containerstack_apptainer_triton_libcuda(self):
         """With --nv, Apptainer gets TRITON_LIBCUDA_PATH=/.singularity.d/libs, unless the caller set it already."""
         root = os.path.join(self.tmpdir, 'install')
