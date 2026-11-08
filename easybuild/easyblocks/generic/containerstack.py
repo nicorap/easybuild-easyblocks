@@ -907,6 +907,7 @@ class ContainerStack(EasyBlock):
         super().__init__(*args, **kwargs)
         self.digest = None
         self.manifest = None
+        self.image_config = None    # the image config (a dict), read once build_step has verified the blobs
         self.blobs_dir = None
         self.registry = self.repo = self.arch_key = None
 
@@ -962,7 +963,8 @@ class ContainerStack(EasyBlock):
     def build_step(self):
         """Build the requested formats from the verified OCI layout, inside the build directory."""
         self.manifest = verify_oci_blobs(self.blobs_dir, self.digest)
-        user, non_root = image_user(read_image_config(self.blobs_dir, self.manifest))
+        self.image_config = read_image_config(self.blobs_dir, self.manifest)
+        user, non_root = image_user(self.image_config)
         if non_root:
             print_warning("ContainerStack: image sets User %r, which enroot and Apptainer ignore: the container runs "
                           "as the calling user (or as root with enroot --root, pyxis --container-remap-root or "
@@ -1001,7 +1003,7 @@ class ContainerStack(EasyBlock):
                 os.chmod(path, entry[0].mode & 0o7777)
         enroot_fixperms(rootfs)
         os.chmod(rootfs, 0o777 & ~current_umask())
-        config = read_image_config(self.blobs_dir, self.manifest)
+        config = self.image_config
         provenance = 'containerstack://%s@%s' % (self.cfg['image'], self.digest)
         for rel, text in enroot_files(config, provenance).items():
             path = rootfs_path(rootfs, rel)
@@ -1102,7 +1104,7 @@ class ContainerStack(EasyBlock):
             'name': self.name, 'version': self.version, 'image': self.cfg['image'],
             'registry': self.registry, 'repository': self.repo, 'arch': self.arch_key, 'digest': self.digest,
             'config_digest': self.manifest['config']['digest'],
-            'image_user': image_user(read_image_config(self.blobs_dir, self.manifest))[0],
+            'image_user': image_user(self.image_config)[0],
             'layers': [layer['digest'] for layer in self.manifest['layers']],
             'files': files, 'runtimes': self.runtime_versions(), 'smoke_tests': results,
             'easybuild': str(EASYBUILD_VERSION), 'easyblocks': str(EASYBLOCKS_VERSION),
