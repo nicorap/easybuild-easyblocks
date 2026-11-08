@@ -809,7 +809,8 @@ WRAPPER_TEMPLATE = r'''#!/bin/bash
 # run it; pyxis does not by default, but does where the site's plugstack sets execute_entrypoint=1.
 # Under pyxis the wrapper starts ONE task, like the plain command (srun --nodes=1 --ntasks=1, even in a big batch job);
 # CS_SRUN_ARGS comes after these and srun's later options win, e.g. CS_SRUN_ARGS="--nodes=2 --ntasks=2" (one per node).
-# Inside a job step (SLURM_STEP_ID set) auto never picks pyxis, and CS_RUNTIME=pyxis fails at once (exit 1).
+# Inside a job step (SLURM_STEP_ID, or SLURM_STEPID, set; not the batch, extern or interactive step) auto never picks
+# pyxis, and CS_RUNTIME=pyxis fails at once (exit 1).
 # With a GPU, Apptainer gets --nv and, unless (APPTAINERENV_)TRITON_LIBCUDA_PATH is set, Triton's libcuda path.
 # The caller's environment goes in under every runtime (enroot: environ() in etc/enroot-no-entrypoint.conf); image ENV
 # beats it, etc/site.env beats both; enroot never takes the caller's PATH, LD_*, locale, HOME, USER, SHELL, TERM.
@@ -845,9 +846,14 @@ fi
 runtime="${CS_RUNTIME:-%(policy)s}"
 case "$runtime" in sif) runtime=apptainer ;; sqsh) runtime=enroot ;; esac
 # pyxis attaches a container only when a step launches, so not inside a step: there a nested srun waits for the
-# resources this step holds (in a whole-node or exclusive step, until the job ends)
+# resources this step holds (in a whole-node or exclusive step, until the job ends). The batch, extern and
+# interactive steps are not such steps: by name, or by Slurm's special ids (current and pre-20.11)
 in_step=
-[ -n "$SLURM_JOB_ID" ] && [ -n "$SLURM_STEP_ID" ] && in_step=1
+step="${SLURM_STEP_ID-${SLURM_STEPID-}}"
+case "$step" in
+    '' | batch | extern | interactive | 4294967290 | 4294967291 | 4294967292 | 4294967294 | 4294967295) ;;
+    *) [ -n "$SLURM_JOB_ID" ] && in_step=1 ;;
+esac
 if [ "$runtime" = auto ]; then
     # use pyxis in an allocation (batch script, salloc), but not inside a step
     if [ -n "$SLURM_JOB_ID" ] && [ -z "$in_step" ] && [ -e "$sqsh" ] && command -v srun >/dev/null 2>&1; then
@@ -865,7 +871,7 @@ join() { local IFS=,; echo "$*"; }
 case "$runtime" in
     pyxis)
         if [ -n "$in_step" ]; then
-            echo "ContainerStack: CS_RUNTIME=pyxis, but already inside job step $SLURM_STEP_ID of job $SLURM_JOB_ID;" \
+            echo "ContainerStack: CS_RUNTIME=pyxis, but already inside job step $step of job $SLURM_JOB_ID;" \
                 "a nested srun would wait for resources held by this step: use CS_RUNTIME=sif or sqsh here, or" \
                 "call the launcher from the batch script" >&2
             exit 1
@@ -958,8 +964,10 @@ class ContainerStack(EasyBlock):
     --fakeroot). The build warns about a non-root User (see image_user), and manifest.json records it as image_user.
 
     The auto launch policy uses pyxis only in an allocation outside a job step (a batch script, salloc): inside a step
-    (SLURM_STEP_ID set) the srun pyxis needs would wait for the resources that step holds, in a whole-node step until
-    the job ends. There auto uses Apptainer or enroot, and CS_RUNTIME=pyxis exits 1 at once, saying so.
+    (SLURM_STEP_ID set, or the older SLURM_STEPID; the batch, extern and interactive steps, named so or by Slurm's
+    special step ids 4294967290-4294967292 and the pre-20.11 4294967294/4294967295, do not count) the srun pyxis
+    needs would wait for the resources that step holds, in a whole-node step until the job ends. There auto uses
+    Apptainer or enroot, and CS_RUNTIME=pyxis exits 1 at once, saying so.
 
     Promotion (`eb --module-only` with hidden = False) must not use --force: EasyBuild then skips the sanity check,
     and with it the check that the install's manifest.json matches the pinned digest.

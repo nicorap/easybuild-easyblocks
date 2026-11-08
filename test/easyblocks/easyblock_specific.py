@@ -1734,6 +1734,39 @@ class EasyBlockSpecificTest(TestCase):
         write_file(os.path.join(fakebin, 'srun'), '#!/bin/bash\necho srun\n')
         self.assertEqual(run({'SLURM_JOB_ID': '42', 'CS_RUNTIME': 'pyxis'})[:3], (0, 'srun\n', ''))
 
+    def test_containerstack_special_step_ids(self):
+        """The batch, extern and interactive steps (by name or Slurm's special ids) are not job steps: pyxis works."""
+        root, fakebin = os.path.join(self.tmpdir, 'install'), os.path.join(self.tmpdir, 'fakebin')
+        for tool in ('srun', 'apptainer'):
+            write_file(os.path.join(fakebin, tool), '#!/bin/bash\necho %s\n' % tool)
+            adjust_permissions(os.path.join(fakebin, tool), stat.S_IXUSR, add=True)
+        for fmt in ('sqsh', 'sif'):
+            write_file(os.path.join(root, 'image.' + fmt), '')
+        wrapper = os.path.join(root, 'bin', 'python')
+        write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64, 'python', 'auto', []))
+        adjust_permissions(wrapper, stat.S_IXUSR, add=True)
+
+        def run(env):
+            env = dict(env, PATH=fakebin + ':/usr/bin:/bin', CS_GPU_DEVICE='/nonexistent', SLURM_JOB_ID='42')
+            res = subprocess.run([wrapper], env=env, capture_output=True, text=True, timeout=60)
+            return res.returncode, res.stdout
+
+        # names, current ids (interactive 0xfffffffa, batch 0xfffffffb, extern 0xfffffffc) and the older ones
+        # (batch 0xfffffffe, extern 0xffffffff); SLURM_STEPID is the older name of SLURM_STEP_ID
+        special = ('interactive', 'batch', 'extern', '4294967290', '4294967291', '4294967292', '4294967294',
+                   '4294967295')
+        for step in special:
+            for var in ('SLURM_STEP_ID', 'SLURM_STEPID'):
+                self.assertEqual(run({var: step}), (0, 'srun\n'), (var, step))
+                self.assertEqual(run({var: step, 'CS_RUNTIME': 'pyxis'}), (0, 'srun\n'), (var, step))
+        # a real step, by either name: auto avoids pyxis, forced pyxis refuses
+        for var in ('SLURM_STEP_ID', 'SLURM_STEPID'):
+            for step in ('0', '7', '4294967289'):
+                self.assertEqual(run({var: step}), (0, 'apptainer\n'), (var, step))
+                self.assertEqual(run({var: step, 'CS_RUNTIME': 'pyxis'})[0], 1, (var, step))
+        # SLURM_STEP_ID is the one that counts when both are set
+        self.assertEqual(run({'SLURM_STEP_ID': 'batch', 'SLURM_STEPID': '0'}), (0, 'srun\n'))
+
     def test_containerstack_apptainer_triton_libcuda(self):
         """With --nv, Apptainer gets TRITON_LIBCUDA_PATH=/.singularity.d/libs, unless the caller set it already."""
         root = os.path.join(self.tmpdir, 'install')
