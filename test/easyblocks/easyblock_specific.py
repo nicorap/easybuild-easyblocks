@@ -1849,6 +1849,30 @@ class EasyBlockSpecificTest(TestCase):
         self.assertEqual((found['etc/hosts'][1], found['etc/hosts'][0].mode), (b'zstd hosts\n', 0o600))
         self.assertEqual(found['etc/resolv.conf'], None)
 
+    def test_containerstack_zstd_layer_hard_link(self):
+        """A hard link's data (that of the member it links to) is found also in a zstd layer streamed by zstd -d."""
+        if not shutil.which('zstd'):
+            self.skipTest("no 'zstd' command in $PATH")
+        blobs = os.path.join(self.tmpdir, 'blobs')
+        members = [_cs_member('etc/hosts.orig', b'old\n'), _cs_member('etc/hosts.orig', b'linked hosts\n'),
+                   _cs_member('./etc/hosts', kind=tarfile.LNKTYPE, mode=0o640, linkname='./etc/hosts.orig'),
+                   _cs_member('etc/resolv.conf', kind=tarfile.LNKTYPE, linkname='etc/hosts.orig'),
+                   _cs_member('etc/hosts.orig', b'replaced after the links\n')]
+        layers = [_cs_layer(blobs, members, zstd=True)]
+        paths = ('etc/hosts', 'etc/resolv.conf')
+        readers = ([True] if containerstack.tarfile_reads_zstd() else []) + [False]    # True: Python >= 3.14
+        for native in readers:
+            if not native:
+                self._cs_without_zstd_tarfile()
+            found = containerstack.image_entries(blobs, layers, paths)
+            self.assertTrue(found['etc/hosts'][0].islnk())
+            self.assertEqual((found['etc/hosts'][1], found['etc/hosts'][0].mode), (b'linked hosts\n', 0o640))
+            self.assertEqual(found['etc/resolv.conf'][1], b'linked hosts\n')
+        dangling = _cs_layer(blobs, [_cs_member('etc/hosts', kind=tarfile.LNKTYPE, linkname='etc/nowhere')],
+                             zstd=True)
+        self.assertRaisesRegex(EasyBuildError, "hard link etc/hosts .* links to etc/nowhere",
+                               containerstack.image_entries, blobs, [dangling], paths)
+
     def test_containerstack_fixperms(self):
         """enroot's fixperms: chmod -R u+rX, then u+w on directories as deep as enroot's find reaches them."""
         root = os.path.join(self.tmpdir, 'rootfs')

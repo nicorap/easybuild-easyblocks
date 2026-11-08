@@ -457,18 +457,49 @@ def image_user(image_config):
     return user, bool(user) and user.split(':', 1)[0] not in ('', '0', 'root')
 
 
+def layer_path(name):
+    """Image path of a layer member name or hard-link target ('./etc/x', '/etc/x' -> 'etc/x')."""
+    return os.path.normpath('/' + name).lstrip('/')
+
+
+def hard_link_data(blobs_dir, layer, links):
+    """
+    {path: data} for the hard links 'links' ({path: TarInfo}) of a layer: the data of the member each links to, the
+    last one of that name before the link (as tarfile resolves it). Read in a second pass over the layer, keeping only
+    those members, because a zstd layer streamed through the 'zstd' command cannot seek back to them.
+    """
+    data = {}
+    with open_layer(blobs_dir, layer) as tar:
+        for member in tar:
+            name = layer_path(member.name)
+            wanted = [path for path, link in links.items()
+                      if member.offset < link.offset and layer_path(link.linkname) == name]
+            for path in wanted:
+                data.pop(path, None)
+            if wanted and member.isfile():
+                content = tar.extractfile(member).read()
+                data.update((path, content) for path in wanted)
+    for path, link in links.items():
+        if path not in data:
+            raise EasyBuildError("ContainerStack: hard link %s in layer %s links to %s, which is not a file "
+                                 "before it in that layer", path, layer['digest'], layer_path(link.linkname))
+    return data
+
+
 def image_entries(blobs_dir, layers, paths):
     """
     For each image path in 'paths': (TarInfo, bytes or None) of its final entry once all layers are applied
     in order (OCI whiteouts and opaque directories included), or None if the image does not have it.
+    A hard link's bytes are those of the member it links to.
     """
     found = dict((path, None) for path in paths)
     for layer in layers:
         # gone: (path, whether the path itself goes too) for what this layer hides of the lower layers
-        entries, gone = {}, []
+        # links: the hard links among this layer's entries, whose data comes from a second pass
+        entries, gone, links = {}, [], {}
         with open_layer(blobs_dir, layer) as tar:
             for member in tar:
-                name = os.path.normpath('/' + member.name).lstrip('/')
+                name = layer_path(member.name)
                 parent, base = os.path.split(name)
                 if base == '.wh..wh..opq':
                     gone.append((parent, False))
@@ -478,8 +509,14 @@ def image_entries(blobs_dir, layers, paths):
                     if not member.isdir():    # a non-directory replaces whatever the lower layers had beneath it
                         gone.append((name, False))
                     if name in found:
-                        data = tar.extractfile(member).read() if member.isfile() or member.islnk() else None
+                        links.pop(name, None)
+                        if member.islnk():
+                            links[name] = member
+                        data = tar.extractfile(member).read() if member.isfile() else None
                         entries[name] = (member, data)
+        if links:
+            for path, data in hard_link_data(blobs_dir, layer, links).items():
+                entries[path] = (entries[path][0], data)
         for path in found:
             if any(not g or path.startswith(g + '/') or (itself and path == g) for g, itself in gone):
                 found[path] = None
