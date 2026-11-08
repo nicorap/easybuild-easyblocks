@@ -2679,7 +2679,7 @@ class EasyBlockSpecificTest(TestCase):
                    "CS_PYTHONPATH to pass paths into the container")
         expected = {
             'Lua': 'if mode() == "load" and (os.getenv("EBROOTPYTHON") or "") ~= "" then\n'
-                   '    io.stderr:write([==[%s\n]==])\nend\n' % warning,
+                   '    io.stderr:write("%s\\n")\nend\n' % warning,
             'Tcl': 'if { [ module-info mode load ] && [ info exists ::env(EBROOTPYTHON) ] && '
                    '$::env(EBROOTPYTHON) ne "" } {\n    puts stderr "%s"\n}\n' % warning,
         }
@@ -2691,6 +2691,31 @@ class EasyBlockSpecificTest(TestCase):
                 txt = eb.make_module_extra()
                 self.assertEqual(expected[syntax] in txt, warns, (syntax, launchers, txt))
                 self.assertEqual('shadow' in txt, warns, (syntax, launchers, txt))
+
+    def test_containerstack_module_warning_quoting(self):
+        """The load warning prints the module name verbatim in Tcl and Lua, whatever characters it has."""
+        eb, _ = self._cs_easyblock(extra="launchers = {'python': 'python'}\n")
+        name = 'odd[x] $y "q" \\z {b} ]==] [exit 3];/1.0'
+        warning = ("WARNING: %s: the container's python now shadows the host Python (EBROOTPYTHON is set); host "
+                   "Python packages are not visible inside the container; set CS_PYTHONPATH to pass paths into the "
+                   "container\n" % name)
+        stubs = {'Tcl': ('tclsh', 'proc module-info {what mode} { return 1 }\n'),
+                 'Lua': ('lua', 'function mode() return "load" end\n')}
+        ran = []
+        for syntax, generator in (('Lua', ModuleGeneratorLua), ('Tcl', ModuleGeneratorTcl)):
+            eb.module_generator = generator(eb, fake=True)
+            with mock.patch.object(containerstack.ContainerStack, 'short_mod_name', new=name):
+                code = eb._host_python_warning()
+            self.assertIn('shadows', code)
+            interpreter, stub = stubs[syntax]
+            if not shutil.which(interpreter):
+                continue
+            res = subprocess.run([shutil.which(interpreter)], input=stub + code, capture_output=True, text=True,
+                                 env={'PATH': os.environ.get('PATH', ''), 'EBROOTPYTHON': '/host/python'})
+            self.assertEqual((res.returncode, res.stdout, res.stderr), (0, '', warning), syntax)
+            ran.append(syntax)
+        if not ran:
+            self.skipTest("neither tclsh nor lua to run the module code with")
 
 
 def suite(loader):

@@ -919,6 +919,36 @@ esac
 '''
 
 
+def escape_chars(text, special, control):
+    """
+    text with each character in special backslash-escaped, newlines as \\n and other control characters as
+    control % their code.
+    """
+    def escape(char):
+        if char in special:
+            return '\\' + char
+        if char == '\n':
+            return '\\n'
+        if ord(char) < 32 or ord(char) == 127:
+            return control % ord(char)
+        return char
+    return ''.join(escape(char) for char in text)
+
+
+def lua_string(text):
+    """text as a double-quoted Lua string literal, as safe as string.format('%q'): \\ and " escaped, controls \\ddd."""
+    return '"%s"' % escape_chars(text, '\\"', '\\%03d')
+
+
+def tcl_string(text):
+    """
+    text as a Tcl word that is text verbatim, also inside a braced body: double-quoted, with each character Tcl
+    substitutes or counts there (\\ " [ ] $ { }; not ';', literal in a quoted word) backslash-escaped, newlines as
+    \\n, other control characters as \\ooo.
+    """
+    return '"%s"' % escape_chars(text, '\\"[]${}', '\\%03o')
+
+
 def render_wrapper(name, version, digest, command, policy, binds):
     """Bash wrapper that runs command (shell words; '' runs the wrapper's own arguments) in the container."""
     if policy not in POLICIES:
@@ -1295,6 +1325,6 @@ class ContainerStack(EasyBlock):
                % (self.short_mod_name, ', '.join(names), '' if len(names) > 1 else 's'))
         if self.module_generator.SYNTAX == 'Lua':
             return ('\nif mode() == "load" and (os.getenv("EBROOTPYTHON") or "") ~= "" then\n'
-                    '    io.stderr:write([==[%s\n]==])\nend\n' % msg)
+                    '    io.stderr:write(%s)\nend\n' % lua_string(msg + '\n'))
         return ('\nif { [ module-info mode load ] && [ info exists ::env(EBROOTPYTHON) ] && '
-                '$::env(EBROOTPYTHON) ne "" } {\n    puts stderr "%s"\n}\n' % msg)
+                '$::env(EBROOTPYTHON) ne "" } {\n    puts stderr %s\n}\n' % tcl_string(msg))
