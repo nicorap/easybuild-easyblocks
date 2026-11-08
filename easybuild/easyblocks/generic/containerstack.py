@@ -810,7 +810,8 @@ WRAPPER_TEMPLATE = r'''#!/bin/bash
 # Under pyxis the wrapper starts ONE task, like the plain command (srun --nodes=1 --ntasks=1, even in a big batch job);
 # CS_SRUN_ARGS comes after these and srun's later options win, e.g. CS_SRUN_ARGS="--nodes=2 --ntasks=2" (one per node).
 # Inside a job step (SLURM_STEP_ID, or SLURM_STEPID, set; not the batch, extern or interactive step) auto never picks
-# pyxis, and CS_RUNTIME=pyxis fails at once (exit 1).
+# pyxis, and CS_RUNTIME=pyxis fails at once (exit 1) unless its srun overlaps the step: --overlap in CS_SRUN_ARGS, or
+# SLURM_OVERLAP set (a GPU request may still wait on some Slurm versions).
 # With a GPU, Apptainer gets --nv and, unless (APPTAINERENV_)TRITON_LIBCUDA_PATH is set, Triton's libcuda path.
 # The caller's environment goes in under every runtime (enroot: environ() in etc/enroot-no-entrypoint.conf); image ENV
 # beats it, etc/site.env beats both; enroot never takes the caller's PATH, LD_*, locale, HOME, USER, SHELL, TERM.
@@ -870,10 +871,18 @@ gpu=
 join() { local IFS=,; echo "$*"; }
 case "$runtime" in
     pyxis)
-        if [ -n "$in_step" ]; then
+        # a nested srun that overlaps this step (--overlap, or SLURM_OVERLAP, which srun reads) may share its resources
+        overlap=
+        [ -n "${SLURM_OVERLAP+set}" ] && overlap=1
+        read -ra words <<< "$CS_SRUN_ARGS"
+        for word in ${words[@]+"${words[@]}"}; do
+            case "$word" in --overlap | --overlap=*) overlap=1 ;; esac
+        done
+        if [ -n "$in_step" ] && [ -z "$overlap" ]; then
             echo "ContainerStack: CS_RUNTIME=pyxis, but already inside job step $step of job $SLURM_JOB_ID;" \
-                "a nested srun would wait for resources held by this step: use CS_RUNTIME=sif or sqsh here, or" \
-                "call the launcher from the batch script" >&2
+                "a nested srun would wait for resources held by this step: use CS_RUNTIME=sif or sqsh here, call" \
+                "the launcher from the batch script, or add --overlap to CS_SRUN_ARGS (or set SLURM_OVERLAP) to" \
+                "share this step's resources (GPU requests may still wait on some Slurm versions)" >&2
             exit 1
         fi
         args=(--container-image="$sqsh")
@@ -967,7 +976,9 @@ class ContainerStack(EasyBlock):
     (SLURM_STEP_ID set, or the older SLURM_STEPID; the batch, extern and interactive steps, named so or by Slurm's
     special step ids 4294967290-4294967292 and the pre-20.11 4294967294/4294967295, do not count) the srun pyxis
     needs would wait for the resources that step holds, in a whole-node step until the job ends. There auto uses
-    Apptainer or enroot, and CS_RUNTIME=pyxis exits 1 at once, saying so.
+    Apptainer or enroot, and CS_RUNTIME=pyxis exits 1 at once, saying so, unless the nested srun shares the step's
+    resources: --overlap (or --overlap=...) in CS_SRUN_ARGS, or SLURM_OVERLAP set, which srun reads as --overlap. Even
+    then an srun that requests GPUs may wait on some Slurm versions; auto never uses pyxis inside a step.
 
     Promotion (`eb --module-only` with hidden = False) must not use --force: EasyBuild then skips the sanity check,
     and with it the check that the install's manifest.json matches the pinned digest.

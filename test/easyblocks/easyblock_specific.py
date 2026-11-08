@@ -1724,8 +1724,10 @@ class EasyBlockSpecificTest(TestCase):
         code, out, err, seconds = run({'SLURM_JOB_ID': '42', 'SLURM_STEP_ID': '3', 'CS_RUNTIME': 'pyxis'})
         self.assertEqual((code, out), (1, ''))
         self.assertEqual(err, "ContainerStack: CS_RUNTIME=pyxis, but already inside job step 3 of job 42; a nested "
-                              "srun would wait for resources held by this step: use CS_RUNTIME=sif or sqsh here, or "
-                              "call the launcher from the batch script\n")
+                              "srun would wait for resources held by this step: use CS_RUNTIME=sif or sqsh here, call "
+                              "the launcher from the batch script, or add --overlap to CS_SRUN_ARGS (or set "
+                              "SLURM_OVERLAP) to share this step's resources (GPU requests may still wait on some "
+                              "Slurm versions)\n")
         self.assertFalse(os.path.exists(called))
         self.assertLess(seconds, 5)
         # auto inside a step is unchanged (Apptainer); pyxis outside a step (batch script) still runs srun
@@ -1733,6 +1735,41 @@ class EasyBlockSpecificTest(TestCase):
         self.assertFalse(os.path.exists(called))
         write_file(os.path.join(fakebin, 'srun'), '#!/bin/bash\necho srun\n')
         self.assertEqual(run({'SLURM_JOB_ID': '42', 'CS_RUNTIME': 'pyxis'})[:3], (0, 'srun\n', ''))
+
+    def test_containerstack_pyxis_overlap_in_step(self):
+        """Inside a job step, CS_RUNTIME=pyxis runs srun when it overlaps the step (--overlap in CS_SRUN_ARGS, or
+        SLURM_OVERLAP set); auto still avoids pyxis there."""
+        root, fakebin = os.path.join(self.tmpdir, 'install'), os.path.join(self.tmpdir, 'fakebin')
+        write_file(os.path.join(fakebin, 'srun'), '#!/bin/bash\necho "srun $*"\n')
+        write_file(os.path.join(fakebin, 'apptainer'), '#!/bin/bash\necho apptainer\n')
+        for tool in ('srun', 'apptainer'):
+            adjust_permissions(os.path.join(fakebin, tool), stat.S_IXUSR, add=True)
+        for fmt in ('sqsh', 'sif'):
+            write_file(os.path.join(root, 'image.' + fmt), '')
+        wrapper = os.path.join(root, 'bin', 'python')
+        write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64, 'python', 'auto', []))
+        adjust_permissions(wrapper, stat.S_IXUSR, add=True)
+        sqsh = os.path.join(os.path.realpath(root), 'image.sqsh')
+
+        def run(env):
+            env = dict(env, PATH=fakebin + ':/usr/bin:/bin', CS_GPU_DEVICE='/nonexistent', SLURM_JOB_ID='42',
+                       SLURM_STEP_ID='3')
+            res = subprocess.run([wrapper], env=env, capture_output=True, text=True, timeout=60)
+            return res.returncode, res.stdout
+
+        for args in ('--overlap', '--gpus=1 --overlap', '--overlap=force', ' -N 1  --overlap '):
+            self.assertEqual(run({'CS_RUNTIME': 'pyxis', 'CS_SRUN_ARGS': args}),
+                             (0, 'srun --nodes=1 --ntasks=1 %s --container-image=%s python\n'
+                                 % (' '.join(args.split()), sqsh)), args)
+        for value in ('1', ''):
+            self.assertEqual(run({'CS_RUNTIME': 'pyxis', 'SLURM_OVERLAP': value}),
+                             (0, 'srun --nodes=1 --ntasks=1 --container-image=%s python\n' % sqsh), value)
+        # only the whole option counts
+        for args in ('--overlapping', '--no-overlap', 'x--overlap', '--overlap,', '-overlap'):
+            self.assertEqual(run({'CS_RUNTIME': 'pyxis', 'CS_SRUN_ARGS': args}), (1, ''), args)
+        # auto inside a step never picks pyxis, overlap or not
+        self.assertEqual(run({'CS_SRUN_ARGS': '--overlap'}), (0, 'apptainer\n'))
+        self.assertEqual(run({'SLURM_OVERLAP': '1'}), (0, 'apptainer\n'))
 
     def test_containerstack_special_step_ids(self):
         """The batch, extern and interactive steps (by name or Slurm's special ids) are not job steps: pyxis works."""
