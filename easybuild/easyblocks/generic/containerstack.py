@@ -763,6 +763,9 @@ WRAPPER_TEMPLATE = r'''#!/bin/bash
 # With a GPU, Apptainer gets --nv and, unless (APPTAINERENV_)TRITON_LIBCUDA_PATH is set, Triton's libcuda path.
 # The caller's environment goes in under every runtime (enroot: environ() in etc/enroot-no-entrypoint.conf); image ENV
 # beats it, etc/site.env beats both; enroot never takes the caller's PATH, LD_*, locale, HOME, USER, SHELL, TERM.
+# No runtime gets the caller's PYTHONPATH or PYTHONHOME: they name a host Python's paths (e.g. a loaded Python module's
+# site-packages), which the container's Python cannot use and which are not mounted; image ENV and site.env still set
+# them. PYTHONUSERBASE and PYTHONNOUSERSITE go in (the user site is per Python version; the default is in $HOME).
 root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)" || exit 1
 sqsh="$root/image.sqsh"
 sif="$root/image.sif"
@@ -770,6 +773,7 @@ cname=%(cname)s
 mounts=(%(mounts)s)
 cmd=(%(cmd)s)
 names=()
+unset PYTHONPATH PYTHONHOME
 if [ -r "$root/etc/site.env" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
         # only NAME=VALUE lines; comments, blank lines and anything else are skipped
@@ -867,6 +871,13 @@ class ContainerStack(EasyBlock):
     LD_LIBRARY_PATH, LD_PRELOAD (neither does pyxis), LANG, LANGUAGE, LC_ALL (pyxis uses the container's) or HOME,
     SHELL, USER, LOGNAME, TERM (enroot sets them for the container's user), nor a value containing a newline (enroot's
     environment file has one variable per line).
+
+    No runtime gets the caller's PYTHONPATH or PYTHONHOME (the wrappers unset them before anything else): with a host
+    Python module loaded they name that interpreter's site-packages, built for another Python version and not mounted
+    in the container, so the container's Python would silently miss them or mix them with its own. The image's ENV
+    and site_env still set them. PYTHONUSERBASE and PYTHONNOUSERSITE are passed on as before: the user site is
+    per Python version (lib/pythonX.Y), it is the user's own choice, and dropping PYTHONUSERBASE would only send the
+    container's Python to ~/.local (mounted with $HOME by default); PYTHONNOUSERSITE=1 is the switch that hides it.
 
     An image's User (config.User, e.g. '1000:1000' or 'appuser') is ignored, as 'enroot import' ignores it (enroot
     4.2.0's docker::configure, src/docker.sh, never reads it) and as `apptainer exec` does: under every runtime the

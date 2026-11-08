@@ -1728,6 +1728,59 @@ class EasyBlockSpecificTest(TestCase):
                                'CS_RUNTIME': 'sqsh', 'CS_GPU_DEVICE': '/nonexistent',
                                'HF_HUB_OFFLINE': '1', 'NCCL_DEBUG': 'INFO', 'SPACED': ' a  b ', 'EMPTY': ''})
 
+    def test_containerstack_python_env_isolation(self):
+        """The caller's PYTHONPATH and PYTHONHOME never reach the container; image ENV and site.env still do."""
+        root, fake = os.path.join(self.tmpdir, 'install'), os.path.join(self.tmpdir, 'fake-enroot')
+        fakebin = os.path.join(self.tmpdir, 'fakebin')
+        names = ('PYTHONPATH', 'PYTHONHOME', 'PYTHONUSERBASE', 'PYTHONNOUSERSITE')
+        # each fake prints the value its runtime gives NAME in the container; the image's ENV is IMAGE_<NAME> here.
+        # Apptainer: APPTAINERENV_<NAME>, else image ENV, else the host's; pyxis: a --container-env name keeps the
+        # job's value, else image ENV, else the job's (enroot: CS_FAKE_ENROOT, with the image's /etc/environment)
+        loop = 'for n in %s; do\n    i=IMAGE_$n a=APPTAINERENV_$n\n%s    echo "IN $n=$v"\ndone\n'
+        write_file(os.path.join(fakebin, 'apptainer'), '#!/bin/bash\n' + loop % (' '.join(names), (
+            '    if [ -n "${!a+set}" ]; then v=${!a}; elif [ -n "${!i+set}" ]; then v=${!i}; else v=${!n-unset}; fi\n'
+        )))
+        write_file(os.path.join(fakebin, 'srun'), '#!/bin/bash\ncenv=,\nfor a in "$@"; do\n'
+                   '    case "$a" in --container-env=*) cenv=",${a#--container-env=},";; esac\ndone\n' +
+                   loop % (' '.join(names), (
+                       '    if [[ $cenv != *,$n,* ]] && [ -n "${!i+set}" ]; then v=${!i}; else v=${!n-unset}; fi\n')))
+        write_file(os.path.join(fakebin, 'enroot'), CS_FAKE_ENROOT.replace('@DIR@', fake))
+        for tool in ('apptainer', 'srun', 'enroot'):
+            adjust_permissions(os.path.join(fakebin, tool), stat.S_IXUSR, add=True)
+        for fmt in ('sqsh', 'sif'):
+            write_file(os.path.join(root, 'image.' + fmt), '')
+        write_file(os.path.join(root, containerstack.ENROOT_NO_ENTRYPOINT), containerstack.ENROOT_NO_ENTRYPOINT_CONF)
+        wrapper = os.path.join(root, 'bin', 'python')
+        write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64, 'python', 'auto', []))
+        adjust_permissions(wrapper, stat.S_IXUSR, add=True)
+        # what a host Python module (e.g. Python 3.13 with packages) leaves in the caller's environment
+        host = {'PYTHONPATH': '/host/lib/python3.13/site-packages', 'PYTHONHOME': '/host/python/3.13',
+                'PYTHONUSERBASE': '/home/u/.local', 'PYTHONNOUSERSITE': '1'}
+
+        def run(runtime, image=None, site=None):
+            write_file(os.path.join(root, 'etc', 'site.env'), ''.join('%s=%s\n' % kv for kv in (site or {}).items()))
+            write_file(os.path.join(fake, 'image-environment'),
+                       ''.join('%s=%s\n' % kv for kv in (image or {}).items()))
+            env = dict(host, PATH=fakebin + ':/usr/bin:/bin', CS_GPU_DEVICE='/nonexistent', CS_RUNTIME=runtime,
+                       SLURM_JOB_ID='42')
+            env.update(('IMAGE_' + k, v) for k, v in (image or {}).items())
+            res = subprocess.run([wrapper, '-c', 'pass'], env=env, capture_output=True, text=True)
+            self.assertEqual((res.returncode, res.stderr), (0, ''), runtime)
+            if runtime == 'sqsh':
+                got = dict(line[4:].split('=', 1) for line in res.stdout.splitlines())
+                return dict((n, got.get(n, 'unset')) for n in names)
+            return dict(line[3:].split('=', 1) for line in res.stdout.splitlines() if line.startswith('IN '))
+
+        for runtime in ('sif', 'sqsh', 'pyxis'):
+            # host interpreter paths mean nothing in the image: gone; the user-site settings go in as before
+            self.assertEqual(run(runtime), {'PYTHONPATH': 'unset', 'PYTHONHOME': 'unset',
+                                            'PYTHONUSERBASE': '/home/u/.local', 'PYTHONNOUSERSITE': '1'}, runtime)
+            # the image's own ENV PYTHONPATH still applies, and site_env beats it
+            self.assertEqual(run(runtime, image={'PYTHONPATH': '/image/py'})['PYTHONPATH'], '/image/py', runtime)
+            self.assertEqual(run(runtime, image={'PYTHONPATH': '/image/py'}, site={'PYTHONPATH': '/site/py'}),
+                             {'PYTHONPATH': '/site/py', 'PYTHONHOME': 'unset', 'PYTHONUSERBASE': '/home/u/.local',
+                              'PYTHONNOUSERSITE': '1'}, runtime)
+
     def _cs_fake_run(self, cmd, **kwargs):
         """Stand-in for run_shell_cmd: records commands and fakes the files Apptainer/mksquashfs would make."""
         self.cs_calls.append(cmd)
