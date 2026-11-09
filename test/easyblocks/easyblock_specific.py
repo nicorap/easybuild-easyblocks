@@ -1954,7 +1954,9 @@ class EasyBlockSpecificTest(TestCase):
                                    'true', 'auto', ['/ok', bind])
             eb, _ = self._cs_easyblock("binds = ['/ok', %r]\n" % bind)
             self.assertRaisesRegex(EasyBuildError, regex, eb.fetch_step)
-        self.assertRaisesRegex(EasyBuildError, "ContainerStack: bind None is empty", containerstack.bind_mounts, [None])
+        for bind in (None, 5, ('/a', '/b')):
+            regex = "ContainerStack: bind %s is empty or not a string" % re.escape(repr(bind))
+            self.assertRaisesRegex(EasyBuildError, regex, containerstack.bind_mounts, ['/ok', bind])
         # the valid forms still pass
         self.assertEqual(containerstack.bind_mounts(['/a', '/a:/b', '/a:/b:ro', '/a/x$y;z:/b/w:rw']),
                          ['/a:/a', '/a:/b', '/a:/b:ro', '/a/x$y;z:/b/w:rw'])
@@ -1984,14 +1986,16 @@ class EasyBlockSpecificTest(TestCase):
             write_file(path, containerstack.render_wrapper('tiny', '1.0', digest, command, 'auto',
                                                            [missing, missing + ':/m:ro']))
             adjust_permissions(path, stat.S_IXUSR, add=True)
-            for runtime, env in (('sif', {}), ('sqsh', {}), ('pyxis', {'SLURM_JOB_ID': '42'})):
+            # auto outside Slurm, and with a step id but no job id (auto, as for a stray SLURM_STEP_ID): Apptainer
+            for runtime, env in (('sif', {}), ('sqsh', {}), ('pyxis', {'SLURM_JOB_ID': '42'}), ('auto', {}),
+                                 ('auto', {'SLURM_STEP_ID': '0'})):
                 for debug in ({}, {'CS_DEBUG': '1'}):
                     full = {'PATH': fakebin + ':/usr/bin:/bin', 'CS_RUNTIME': runtime}
                     full.update(env, **debug)
                     res = subprocess.run(['bash', '-u', path], env=full, capture_output=True, text=True, timeout=60)
                     self.assertEqual(res.returncode, 0, (name, runtime, debug, res.stderr))
                     self.assertNotIn('unbound variable', res.stderr)
-                    tool = {'sif': 'apptainer', 'sqsh': 'enroot', 'pyxis': 'srun'}[runtime]
+                    tool = {'sif': 'apptainer', 'sqsh': 'enroot', 'pyxis': 'srun', 'auto': 'apptainer'}[runtime]
                     self.assertEqual(res.stdout.splitlines()[-1].split()[:2], ['TOOL', tool], (name, runtime))
 
     def test_containerstack_pyxis_inside_step(self):
