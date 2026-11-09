@@ -1840,6 +1840,9 @@ class EasyBlockSpecificTest(TestCase):
             else:
                 args = ['ARG start', 'ARG --conf', 'ARG ' + conf]
                 for mount in mounts:
+                    # enroot: an fstab line, options after type and bind flags (test_containerstack_bind_options)
+                    src, dst, *opts = mount.split(':')
+                    mount = ':'.join([src, dst] + ['none:x-create=auto,rbind,' + opt for opt in opts])
                     args += ['ARG --mount', 'ARG ' + mount]
                 args.append(cname)
             tool = {'pyxis': 'srun'}.get(runtime, runtime)
@@ -1878,6 +1881,58 @@ class EasyBlockSpecificTest(TestCase):
         self.assertEqual(run(some, {'APPTAINER_BIND': '/scratch'}), (expected('apptainer', kept, '/scratch'), ''))
         # no shell in a bind ran, in the check or the message
         self.assertEqual(sorted(os.listdir(host)), sorted(os.path.basename(p) for p in (data, ref, odd, dangling)))
+
+    def test_containerstack_bind_options(self):
+        """
+        A bind's options are 'ro' or 'rw', checked when the wrappers are written, and each runtime gets them in its own
+        form: Apptainer src:dst:ro, pyxis src:dst:ro+nofail..., enroot an fstab line that is still a bind.
+        """
+        root, fakebin = os.path.join(self.tmpdir, 'install'), os.path.join(self.tmpdir, 'fakebin')
+        for tool in ('srun', 'apptainer', 'enroot'):
+            path = os.path.join(fakebin, tool)
+            write_file(path, '#!/bin/bash\nfor a in "$@"; do echo "$a"; done\n')
+            adjust_permissions(path, stat.S_IXUSR, add=True)
+        for fmt in ('sqsh', 'sif'):
+            write_file(os.path.join(root, 'image.' + fmt), '')
+        src_a, src_b, src_c = (os.path.join(self.tmpdir, 'host', n) for n in 'abc')
+        for path in (src_a, src_b, src_c):
+            mkdir(path, parents=True)
+        digest = 'sha256:' + 'a' * 64
+        wrapper = os.path.join(root, 'bin', 'opts')
+        write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', digest, 'true', 'auto',
+                                                          [src_a + ':/a:ro', src_b + ':/b:rw', src_c]))
+        adjust_permissions(wrapper, stat.S_IXUSR, add=True)
+
+        def args(env):
+            full = {'PATH': fakebin + ':/usr/bin:/bin', 'CS_GPU_DEVICE': '/nonexistent'}
+            full.update(env)
+            res = subprocess.run([wrapper], env=full, capture_output=True, text=True, timeout=60)
+            self.assertEqual((res.returncode, res.stderr), (0, ''))
+            return res.stdout.splitlines()
+
+        out = args({})
+        self.assertEqual(out[out.index('--bind') + 1], '%s:/a:ro,%s:/b:rw,%s:%s' % (src_a, src_b, src_c, src_c))
+        out = args({'SLURM_JOB_ID': '42'})
+        self.assertIn('--container-mounts=%s:/a:ro+nofail+silent,%s:/b:rw+nofail+silent,%s:%s:nofail+silent'
+                      % (src_a, src_b, src_c, src_c), out)
+        out = args({'CS_RUNTIME': 'sqsh'})
+        mounts = [out[i + 1] for i, arg in enumerate(out) if arg == '--mount']
+        self.assertEqual(mounts, [src_a + ':/a:none:x-create=auto,rbind,ro', src_b + ':/b:none:x-create=auto,rbind,rw',
+                                  '%s:%s' % (src_c, src_c)])
+        # enroot 4.2.0 (runtime::_do_mounts_fini) turns each into an fstab line with tr ':' ' '; enroot-mount binds
+        # (type none, rbind) and creates the target; src:dst alone gets its default 'none rbind,x-create=auto'
+        for mount, opt in zip(mounts, ('ro', 'rw')):
+            fsname, fsdir, fstype, fsopts = mount.replace(':', ' ').split()
+            self.assertEqual((fstype, fsopts.split(',')), ('none', ['x-create=auto', 'rbind', opt]))
+        # anything else fails when the wrappers are written, naming the bind
+        for bad in ('rbind', 'ro,nosuid', 'RO', 'nofail', 'ro+nofail', 'bind,ro', ''):
+            bind = src_a + ':/a:' + bad
+            self.assertRaisesRegex(EasyBuildError, "bind %s: options must be 'ro' or 'rw', not '%s'"
+                                   % (re.escape(repr(bind)), re.escape(bad)),
+                                   containerstack.render_wrapper, 'tiny', '1.0', digest, 'true', 'auto', [bind])
+        # and before anything is fetched
+        eb, _ = self._cs_easyblock("binds = ['/data:/data:nosuid']\n")
+        self.assertRaisesRegex(EasyBuildError, "bind '/data:/data:nosuid': options must be 'ro' or 'rw'", eb.fetch_step)
 
     def test_containerstack_pyxis_inside_step(self):
         """CS_RUNTIME=pyxis inside a job step fails at once: a nested srun would wait for this step's resources."""
