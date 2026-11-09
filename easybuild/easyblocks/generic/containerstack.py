@@ -870,7 +870,7 @@ if [ -r "$root/etc/site.env" ]; then
         case "$name" in '' | [0-9]* | *[!A-Za-z0-9_]*) continue ;; esac
         # Apptainer lets image ENV beat host env; APPTAINERENV_<NAME> beats image ENV
         export "$line" "APPTAINERENV_$line"
-        case " ${names[*]} " in *" $name "*) ;; *) names+=("$name") ;; esac
+        case " ${names[*]-} " in *" $name "*) ;; *) names+=("$name") ;; esac
     done < "$root/etc/site.env"
 fi
 runtime="${CS_RUNTIME:-%(policy)s}"
@@ -882,11 +882,11 @@ in_step=
 step="${SLURM_STEP_ID:-${SLURM_STEPID-}}"    # an empty SLURM_STEP_ID counts as unset
 case "$step" in
     '' | batch | extern | interactive | 4294967290 | 4294967291 | 4294967292 | 4294967294 | 4294967295) ;;
-    *) [ -n "$SLURM_JOB_ID" ] && in_step=1 ;;
+    *) [ -n "${SLURM_JOB_ID:-}" ] && in_step=1 ;;
 esac
 if [ "$runtime" = auto ]; then
     # use pyxis in an allocation (batch script, salloc), but not inside a step
-    if [ -n "$SLURM_JOB_ID" ] && [ -z "$in_step" ] && [ -e "$sqsh" ] && command -v srun >/dev/null 2>&1; then
+    if [ -n "${SLURM_JOB_ID:-}" ] && [ -z "$in_step" ] && [ -e "$sqsh" ] && command -v srun >/dev/null 2>&1; then
         runtime=pyxis
     elif [ -e "$sif" ]; then
         runtime=apptainer
@@ -894,7 +894,7 @@ if [ "$runtime" = auto ]; then
         runtime=enroot
     fi
 fi
-[ -n "$CS_DEBUG" ] && echo "ContainerStack: runtime=$runtime" >&2
+[ -n "${CS_DEBUG:-}" ] && echo "ContainerStack: runtime=$runtime" >&2
 # Apptainer, enroot and pyxis all fail on a bind whose source is missing, e.g. a filesystem only some nodes have.
 # Apptainer and enroot run here, so a source missing here is skipped here; pyxis runs the step wherever srun puts it
 # (salloc from a login node, several nodes), so there every bind gets enroot's nofail mount flag instead (below)
@@ -904,7 +904,7 @@ if [ "$runtime" != pyxis ]; then
         src="${m%%%%:*}"
         if [ -e "$src" ]; then
             present+=("$m")
-        elif [ -n "$CS_DEBUG" ]; then
+        elif [ -n "${CS_DEBUG:-}" ]; then
             echo "ContainerStack: bind $m skipped: $src does not exist on this node" >&2
         fi
     done
@@ -919,12 +919,12 @@ case "$runtime" in
         overlap=
         [ -n "${SLURM_OVERLAP+set}" ] && overlap=1
         # all of it, as srun gets it: split on spaces, tabs and newlines (read -d '': not just the first line)
-        read -ra words -d '' <<< "$CS_SRUN_ARGS"
+        read -ra words -d '' <<< "${CS_SRUN_ARGS-}"
         for word in ${words[@]+"${words[@]}"}; do
             case "$word" in --overlap | --overlap=*) overlap=1 ;; esac
         done
         if [ -n "$in_step" ] && [ -z "$overlap" ]; then
-            echo "ContainerStack: CS_RUNTIME=pyxis, but already inside job step $step of job $SLURM_JOB_ID;" \
+            echo "ContainerStack: CS_RUNTIME=pyxis, but already inside job step $step of job ${SLURM_JOB_ID-};" \
                 "a nested srun would wait for resources held by this step: use CS_RUNTIME=sif or sqsh here, call" \
                 "the launcher from the batch script, or add --overlap to CS_SRUN_ARGS (or set SLURM_OVERLAP) to" \
                 "share this step's resources (GPU requests may still wait on some Slurm versions)" >&2
@@ -934,14 +934,14 @@ case "$runtime" in
         # not checked here: each node's enroot-mount skips a bind whose source it lacks (nofail), silently unless
         # CS_DEBUG is set; pyxis puts the flags, '+'-separated, after its own (x-create=auto,rbind)
         flags=nofail
-        [ -z "$CS_DEBUG" ] && flags=nofail+silent
+        [ -z "${CS_DEBUG:-}" ] && flags=nofail+silent
         checked=()
         for m in ${mounts[@]+"${mounts[@]}"}; do
             case "$m" in *:*:*) checked+=("$m+$flags") ;; *) checked+=("$m:$flags") ;; esac
         done
         [ ${#checked[@]} -gt 0 ] && args+=(--container-mounts="$(join "${checked[@]}")")
         [ ${#names[@]} -gt 0 ] && args+=(--container-env="$(join "${names[@]}")")
-        exec srun --nodes=1 --ntasks=1 $CS_SRUN_ARGS "${args[@]}" "${cmd[@]}" "$@" ;;
+        exec srun --nodes=1 --ntasks=1 ${CS_SRUN_ARGS-} "${args[@]}" ${cmd[@]+"${cmd[@]}"} "$@" ;;
     apptainer)
         command -v apptainer >/dev/null 2>&1 || { echo "ContainerStack: apptainer not found on PATH" >&2; exit 127; }
         args=()
@@ -954,22 +954,22 @@ case "$runtime" in
             fi
         fi
         [ ${#mounts[@]} -gt 0 ] && args+=(--bind "$(join "${mounts[@]}")")
-        exec apptainer exec "${args[@]}" "$sif" "${cmd[@]}" "$@" ;;
+        exec apptainer exec ${args[@]+"${args[@]}"} "$sif" ${cmd[@]+"${cmd[@]}"} "$@" ;;
     enroot)
         command -v enroot >/dev/null 2>&1 || { echo "ContainerStack: enroot not found on PATH" >&2; exit 127; }
         enroot list | grep -qxF "$cname" || enroot create -n "$cname" "$sqsh" >/dev/null || exit 1
         args=(--conf "$root/etc/enroot-no-entrypoint.conf")
         [ -n "$gpu" ] && args+=(--env NVIDIA_VISIBLE_DEVICES=all)
-        for m in "${mounts[@]}"; do
+        for m in ${mounts[@]+"${mounts[@]}"}; do
             # enroot makes an fstab line of it (tr ':' ' '); src:dst alone defaults to type none, rbind,x-create=auto,
             # but options would stand in for those, so they follow the type and the bind flags
             case "$m" in *:*:*) m="${m%%:*}:none:x-create=auto,rbind,${m##*:}" ;; esac
             args+=(--mount "$m")
         done
-        for n in "${names[@]}"; do args+=(--env "$n"); done
+        for n in ${names[@]+"${names[@]}"}; do args+=(--env "$n"); done
         # the caller's environment, through the --conf file's environ() (image ENV and site.env win, as under pyxis)
         export CS_CALLER_ENV="$(compgen -e)"
-        exec enroot start "${args[@]}" "$cname" "${cmd[@]}" "$@" ;;
+        exec enroot start "${args[@]}" "$cname" ${cmd[@]+"${cmd[@]}"} "$@" ;;
     *)
         echo "ContainerStack: unknown CS_RUNTIME '$runtime' (use auto, apptainer, enroot, pyxis, sif or sqsh)" >&2
         exit 2 ;;

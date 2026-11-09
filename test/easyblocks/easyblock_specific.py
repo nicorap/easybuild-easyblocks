@@ -1959,6 +1959,41 @@ class EasyBlockSpecificTest(TestCase):
         self.assertEqual(containerstack.bind_mounts(['/a', '/a:/b', '/a:/b:ro', '/a/x$y;z:/b/w:rw']),
                          ['/a:/a', '/a:/b', '/a:/b:ro', '/a/x$y;z:/b/w:rw'])
 
+    def test_containerstack_wrapper_nounset(self):
+        """
+        The wrappers run under bash -u (set -o nounset, e.g. sourced into a strict script's habits or run as bash -u):
+        no unset variable or empty array is expanded (bash 3.2, macOS's /bin/bash, counts an empty array as unset),
+        under sif, sqsh and pyxis, with no binds left, no GPU, no command words, no arguments, with and without
+        site.env.
+        """
+        root, fakebin = os.path.join(self.tmpdir, 'install'), os.path.join(self.tmpdir, 'fakebin')
+        for tool in ('srun', 'apptainer', 'enroot'):
+            path = os.path.join(fakebin, tool)
+            write_file(path, '#!/bin/bash\necho "TOOL $(basename "$0") $#"\n')
+            adjust_permissions(path, stat.S_IXUSR, add=True)
+        for fmt in ('sqsh', 'sif'):
+            write_file(os.path.join(root, 'image.' + fmt), '')
+        missing = os.path.join(self.tmpdir, 'missing')
+        digest = 'sha256:' + 'a' * 64
+        site_env = os.path.join(root, 'etc', 'site.env')
+        for name, command in (('tool', 'true'), ('.cs-run', '')):
+            # first without site.env (no names), then with one (the first name read meets an empty list)
+            if name == '.cs-run':
+                write_file(site_env, 'OMP_NUM_THREADS=1\n')
+            path = os.path.join(root, 'bin', name)
+            write_file(path, containerstack.render_wrapper('tiny', '1.0', digest, command, 'auto',
+                                                           [missing, missing + ':/m:ro']))
+            adjust_permissions(path, stat.S_IXUSR, add=True)
+            for runtime, env in (('sif', {}), ('sqsh', {}), ('pyxis', {'SLURM_JOB_ID': '42'})):
+                for debug in ({}, {'CS_DEBUG': '1'}):
+                    full = {'PATH': fakebin + ':/usr/bin:/bin', 'CS_RUNTIME': runtime}
+                    full.update(env, **debug)
+                    res = subprocess.run(['bash', '-u', path], env=full, capture_output=True, text=True, timeout=60)
+                    self.assertEqual(res.returncode, 0, (name, runtime, debug, res.stderr))
+                    self.assertNotIn('unbound variable', res.stderr)
+                    tool = {'sif': 'apptainer', 'sqsh': 'enroot', 'pyxis': 'srun'}[runtime]
+                    self.assertEqual(res.stdout.splitlines()[-1].split()[:2], ['TOOL', tool], (name, runtime))
+
     def test_containerstack_pyxis_inside_step(self):
         """CS_RUNTIME=pyxis inside a job step fails at once: a nested srun would wait for this step's resources."""
         root, fakebin = os.path.join(self.tmpdir, 'install'), os.path.join(self.tmpdir, 'fakebin')
