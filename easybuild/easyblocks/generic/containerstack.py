@@ -1010,11 +1010,23 @@ def tcl_string(text):
 def bind_mounts(binds):
     """
     binds as the wrappers take them: 'src:dst' or 'src:dst:ro' / 'src:dst:rw' ('path' becomes 'path:path').
-    Other options fail (EasyBuildError): each runtime spells them differently, the wrappers translate only these.
+    Anything else fails (EasyBuildError naming the bind): an empty bind or not a string; ',' or whitespace, on which
+    Apptainer and pyxis split a bind list and enroot an fstab line; more than three fields; a src or dst that is not
+    an absolute path; options other than ro and rw, which each runtime spells differently (the wrappers translate
+    only these).
     """
     mounts = []
     for bind in binds:
+        if not bind or not isinstance(bind, str):
+            raise EasyBuildError("ContainerStack: bind %r is empty or not a string", bind)
+        if re.search(r'[\s,]', bind):
+            raise EasyBuildError("ContainerStack: bind %r contains ',' or whitespace", bind)
         fields = bind.split(':')
+        if len(fields) > 3:
+            raise EasyBuildError("ContainerStack: bind %r has more than 3 ':'-separated fields (src:dst:ro|rw)",
+                                 bind)
+        if not all(path.startswith('/') for path in fields[:2]):
+            raise EasyBuildError("ContainerStack: bind %r has a src or dst that is not an absolute path", bind)
         if len(fields) == 3 and fields[2] not in BIND_OPTIONS:
             raise EasyBuildError("ContainerStack: bind %r: options must be 'ro' or 'rw', not %r", bind, fields[2])
         mounts.append(bind if ':' in bind else '%s:%s' % (bind, bind))
@@ -1090,9 +1102,10 @@ class ContainerStack(EasyBlock):
     whitespace including newlines), or SLURM_OVERLAP set, which srun reads as --overlap. Even then an srun that
     requests GPUs may wait on some Slurm versions; auto never uses pyxis inside a step.
 
-    binds are 'path' (mounted at the same path), 'src:dst' or 'src:dst:ro' / 'src:dst:rw'; any other options fail
-    when the easyconfig is checked, as each runtime spells them its own way. The wrappers translate: Apptainer gets
-    --bind src:dst:ro, pyxis --container-mounts=src:dst:ro+nofail(+silent), and enroot --mount
+    binds are 'path' (mounted at the same path), 'src:dst' or 'src:dst:ro' / 'src:dst:rw', with absolute paths and
+    no ',' or whitespace (the runtimes split on them); anything else, other options included, fails when the
+    easyconfig is checked (see bind_mounts), as each runtime spells options its own way. The wrappers translate:
+    Apptainer gets --bind src:dst:ro, pyxis --container-mounts=src:dst:ro+nofail(+silent), and enroot --mount
     src:dst:none:x-create=auto,rbind,ro: enroot 4.2.0 makes an fstab line of it (runtime.sh, tr ':' ' '), and
     enroot-mount gives a bare 'src dst' the type none and the options rbind,x-create=auto, which a third field would
     replace (src:dst:ro alone would not be a bind); src:dst without options is passed as is.

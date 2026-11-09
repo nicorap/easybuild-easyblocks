@@ -1794,25 +1794,26 @@ class EasyBlockSpecificTest(TestCase):
         sif, sqsh = os.path.join(real, 'image.sif'), os.path.join(real, 'image.sqsh')
         conf = os.path.join(real, containerstack.ENROOT_NO_ENTRYPOINT)
         host = os.path.join(self.tmpdir, 'host')
-        data = os.path.join(host, 'shared data')                     # a space in the source
+        data = os.path.join(host, 'shared-data')
         ref = os.path.join(host, 'ref.txt')                          # a file
-        odd = os.path.join(host, 'x$(touch pwned);`touch pwned`')     # shell in a name is never run
+        odd = os.path.join(host, 'x$(touch${IFS}pwned);`touch${IFS}pwned`')     # shell in a name is never run
+        glob = os.path.join(host, 'shared-dat?')                     # missing, but its glob matches data
         mkdir(data, parents=True)
         mkdir(odd, parents=True)
         write_file(ref, '')
         dangling = os.path.join(host, 'dangling')                    # a symlink to nothing counts as missing
         os.symlink(os.path.join(host, 'gone'), dangling)
         missing = os.path.join(host, 'missing')
-        missing_odd = os.path.join(host, 'm$(touch pwned) x')
+        missing_odd = os.path.join(host, 'm$(touch${IFS}pwned)x')
         binds = [missing, data, dangling + ':/dangling', ref + ':/ref.txt:ro', missing + ':/m:ro', odd + ':/odd',
-                 missing_odd]
+                 missing_odd, glob + ':/glob']
         skipped = ['%s:%s' % (missing, missing), dangling + ':/dangling', missing + ':/m:ro',
-                   '%s:%s' % (missing_odd, missing_odd)]
+                   '%s:%s' % (missing_odd, missing_odd), glob + ':/glob']
         kept = ['%s:%s' % (data, data), ref + ':/ref.txt:ro', odd + ':/odd']
-        normalised = [skipped[0], kept[0], skipped[1], kept[1], skipped[2], kept[2], skipped[3]]
+        normalised = [skipped[0], kept[0], skipped[1], kept[1], skipped[2], kept[2], skipped[3], skipped[4]]
         # the precondition: the sources the test skips are missing here, the ones it keeps exist
         self.assertEqual([os.path.exists(b.split(':')[0]) for b in binds],
-                         [False, True, False, True, False, True, False])
+                         [False, True, False, True, False, True, False, False])
         self.assertTrue(os.path.islink(dangling))
 
         def wrapper(name, binds):
@@ -1925,7 +1926,7 @@ class EasyBlockSpecificTest(TestCase):
             fsname, fsdir, fstype, fsopts = mount.replace(':', ' ').split()
             self.assertEqual((fstype, fsopts.split(',')), ('none', ['x-create=auto', 'rbind', opt]))
         # anything else fails when the wrappers are written, naming the bind
-        for bad in ('rbind', 'ro,nosuid', 'RO', 'nofail', 'ro+nofail', 'bind,ro', ''):
+        for bad in ('rbind', 'nosuid', 'RO', 'nofail', 'ro+nofail', 'x-create=dir', ''):
             bind = src_a + ':/a:' + bad
             self.assertRaisesRegex(EasyBuildError, "bind %s: options must be 'ro' or 'rw', not '%s'"
                                    % (re.escape(repr(bind)), re.escape(bad)),
@@ -1933,6 +1934,30 @@ class EasyBlockSpecificTest(TestCase):
         # and before anything is fetched
         eb, _ = self._cs_easyblock("binds = ['/data:/data:nosuid']\n")
         self.assertRaisesRegex(EasyBuildError, "bind '/data:/data:nosuid': options must be 'ro' or 'rw'", eb.fetch_step)
+
+    def test_containerstack_bind_validation(self):
+        """
+        A bind must be 'path', 'src:dst' or 'src:dst:ro|rw' with absolute paths and no ',' or whitespace (the runtimes
+        split a bind list on ',', enroot an fstab line on whitespace): anything else fails when the easyconfig is
+        checked and when the wrappers are written, naming the bind.
+        """
+        digest = 'sha256:' + 'a' * 64
+        relative = 'has a src or dst that is not an absolute path'
+        cases = [('', 'is empty'), ('/a,/b', "contains ',' or whitespace"), ('/a b', "contains ',' or whitespace"),
+                 ('/a:/b\t', "contains ',' or whitespace"), ('/a\n', "contains ',' or whitespace"),
+                 ('/a:/b:ro:x', "has more than 3 ':'-separated fields"), ('/a:/b:ro:', "has more than 3"),
+                 ('data', relative), ('./data:/data', relative), ('/data:data', relative), ('/data:', relative),
+                 (':/data', relative), ('/a::ro', relative), ('~/data', relative)]
+        for bind, msg in cases:
+            regex = "ContainerStack: bind %s %s" % (re.escape(repr(bind)), msg)
+            self.assertRaisesRegex(EasyBuildError, regex, containerstack.render_wrapper, 'tiny', '1.0', digest,
+                                   'true', 'auto', ['/ok', bind])
+            eb, _ = self._cs_easyblock("binds = ['/ok', %r]\n" % bind)
+            self.assertRaisesRegex(EasyBuildError, regex, eb.fetch_step)
+        self.assertRaisesRegex(EasyBuildError, "ContainerStack: bind None is empty", containerstack.bind_mounts, [None])
+        # the valid forms still pass
+        self.assertEqual(containerstack.bind_mounts(['/a', '/a:/b', '/a:/b:ro', '/a/x$y;z:/b/w:rw']),
+                         ['/a:/a', '/a:/b', '/a:/b:ro', '/a/x$y;z:/b/w:rw'])
 
     def test_containerstack_pyxis_inside_step(self):
         """CS_RUNTIME=pyxis inside a job step fails at once: a nested srun would wait for this step's resources."""
