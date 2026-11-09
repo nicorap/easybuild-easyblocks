@@ -1849,6 +1849,9 @@ class EasyBlockSpecificTest(TestCase):
             tool = {'pyxis': 'srun'}.get(runtime, runtime)
             return ['TOOL ' + tool] + args + ['ARG true', 'ENV APPTAINER_BIND=' + bind_env]
 
+        pyxis_debug = ('ContainerStack: binds not checked here: under pyxis each node skips one whose source it lacks '
+                       '(mount flag nofail), with no message\n')
+
         def pyxis_mounts(normalised, flags):
             # pyxis: '+' joins mount flags; nofail after the bind's own option, if any
             return [m + ('+' if m.count(':') == 2 else ':') + flags for m in normalised]
@@ -1865,10 +1868,11 @@ class EasyBlockSpecificTest(TestCase):
             mounts = mounts if runtime == 'pyxis' else kept
             out, err = run(some, dict(env, CS_DEBUG='1'))
             self.assertEqual(out, expected(runtime, mounts), runtime)
+            # pyxis: one line saying so (pyxis shows enroot's output only when the container fails to start)
             self.assertEqual(err, 'ContainerStack: runtime=%s\n' % runtime +
                              ''.join('ContainerStack: bind %s skipped: %s does not exist on this node\n'
-                                     % (bind, bind.split(':')[0]) for bind in skipped if runtime != 'pyxis'),
-                             runtime)
+                                     % (bind, bind.split(':')[0]) for bind in skipped if runtime != 'pyxis') +
+                             (pyxis_debug if runtime == 'pyxis' else ''), runtime)
         # none exists: no empty --bind/--mount (pyxis: all, nofail), and the user's own APPTAINER_BIND still applies
         none = wrapper('none', [missing, dangling + ':/dangling', missing_odd + ':/m:ro'])
         for runtime, env in runtimes.items():
@@ -1877,8 +1881,11 @@ class EasyBlockSpecificTest(TestCase):
             self.assertEqual(run(none, env), (expected(runtime, mounts), ''), runtime)
             self.assertEqual(run(none, dict(env, APPTAINER_BIND='/scratch:/scratch')),
                              (expected(runtime, mounts, '/scratch:/scratch'), ''), runtime)
-        # pyxis without binds: no --container-mounts
-        self.assertEqual(run(wrapper('nobinds', []), runtimes['pyxis']), (expected('pyxis', []), ''))
+        # pyxis without binds: no --container-mounts, and no line about them with CS_DEBUG
+        nobinds = wrapper('nobinds', [])
+        self.assertEqual(run(nobinds, runtimes['pyxis']), (expected('pyxis', []), ''))
+        self.assertEqual(run(nobinds, dict(runtimes['pyxis'], CS_DEBUG='1')),
+                         (expected('pyxis', []), 'ContainerStack: runtime=pyxis\n'))
         self.assertEqual(run(some, {'APPTAINER_BIND': '/scratch'}), (expected('apptainer', kept, '/scratch'), ''))
         # no shell in a bind ran, in the check or the message
         self.assertEqual(sorted(os.listdir(host)), sorted(os.path.basename(p) for p in (data, ref, odd, dangling)))

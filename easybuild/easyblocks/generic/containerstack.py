@@ -829,7 +829,7 @@ WRAPPER_TEMPLATE = r'''#!/bin/bash
 # CS_SRUN_ARGS adds srun options for pyxis (word-split); APPTAINER_BIND adds Apptainer mounts.
 # A bind ('src:dst' or 'src:dst:ro|rw') whose src does not exist (a dangling symlink neither) is skipped: under
 # Apptainer and enroot here, silently or with one stderr line each when CS_DEBUG is set; under pyxis on each node of
-# the step (enroot's nofail mount flag on every bind, plus silent unless CS_DEBUG is set), never on the srun caller.
+# the step, never on the srun caller (enroot's nofail mount flag on every bind), with no message (CS_DEBUG says so).
 # The command runs, not the image's entrypoint: apptainer exec and enroot (etc/enroot-no-entrypoint.conf) never
 # run it; pyxis does not by default, but does where the site's plugstack sets execute_entrypoint=1.
 # Under pyxis the wrapper starts ONE task, like the plain command (srun --nodes=1 --ntasks=1, even in a big batch job);
@@ -931,14 +931,17 @@ case "$runtime" in
             exit 1
         fi
         args=(--container-image="$sqsh")
-        # not checked here: each node's enroot-mount skips a bind whose source it lacks (nofail), silently unless
-        # CS_DEBUG is set; pyxis puts the flags, '+'-separated, after its own (x-create=auto,rbind)
+        # not checked here: each node's enroot-mount skips a bind whose source it lacks (nofail; silent unless
+        # CS_DEBUG is set, though pyxis shows enroot's output only when the container fails to start); pyxis puts
+        # the flags, '+'-separated, after its own (x-create=auto,rbind)
         flags=nofail
         [ -z "${CS_DEBUG:-}" ] && flags=nofail+silent
         checked=()
         for m in ${mounts[@]+"${mounts[@]}"}; do
             case "$m" in *:*:*) checked+=("$m+$flags") ;; *) checked+=("$m:$flags") ;; esac
         done
+        [ -n "${CS_DEBUG:-}" ] && [ ${#checked[@]} -gt 0 ] && echo "ContainerStack: binds not checked here: under" \
+            "pyxis each node skips one whose source it lacks (mount flag nofail), with no message" >&2
         [ ${#checked[@]} -gt 0 ] && args+=(--container-mounts="$(join "${checked[@]}")")
         [ ${#names[@]} -gt 0 ] && args+=(--container-env="$(join "${names[@]}")")
         exec srun --nodes=1 --ntasks=1 ${CS_SRUN_ARGS-} "${args[@]}" ${cmd[@]+"${cmd[@]}"} "$@" ;;
@@ -1118,8 +1121,10 @@ class ContainerStack(EasyBlock):
     --nodes=2 in CS_SRUN_ARGS every node mounts): it passes every bind, each with enroot's mount flags 'nofail' and,
     unless CS_DEBUG is set, 'silent' ('+'-separated after the bind's options, as --container-mounts takes them;
     pyxis puts them after its own x-create=auto,rbind), so enroot-mount on each node skips a source it lacks (enroot
-    4.2.0, enroot-mount.c: fatal unless nofail; with CS_DEBUG it warns on that node's stderr). Under pyxis nofail
-    also skips a bind that fails for another reason, e.g. a source the user may not read.
+    4.2.0, enroot-mount.c: fatal unless nofail). Without 'silent' (CS_DEBUG) enroot-mount warns, but pyxis shows
+    enroot's output only when the container fails to start, so a skip under pyxis gives no message; with CS_DEBUG
+    the wrapper says once that the binds were passed unchecked. Under pyxis nofail also skips a bind that fails for
+    another reason, e.g. a source the user may not read.
     The quoting is unchanged: a bind is data in the wrapper, never shell.
 
     Promotion (`eb --module-only` with hidden = False) must not use --force: EasyBuild then skips the sanity check,
@@ -1133,7 +1138,7 @@ class ContainerStack(EasyBlock):
         extra_vars.update({
             'binds': [[], "Host paths to mount in the container ('path', 'src:dst', 'src:dst:ro' or 'src:dst:rw'); "
                       "at run time one whose src does not exist is skipped: by the wrapper under Apptainer and enroot "
-                      "(CS_DEBUG=1 says so), by each node under pyxis (mount flag nofail)", CUSTOM],
+                      "(CS_DEBUG=1 says so), silently by each node under pyxis (mount flag nofail)", CUSTOM],
             'digests': [{}, "Per-architecture manifest digests: {'x86_64': 'sha256:...', 'aarch64': 'sha256:...'}",
                         CUSTOM],
             'formats': [['sqsh', 'sif'], "Formats to produce: 'sqsh' (enroot/pyxis) and/or 'sif' (Apptainer)",
