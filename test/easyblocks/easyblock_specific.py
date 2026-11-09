@@ -1738,7 +1738,8 @@ class EasyBlockSpecificTest(TestCase):
         code, out, err = run({'SLURM_JOB_ID': '42'})
         self.assertEqual(err, '')
         self.assertEqual(out, ['TOOL srun', 'ARG --nodes=1', 'ARG --ntasks=1', 'ARG --container-image=' + sqsh,
-                               'ARG --container-mounts=' + mounts, 'ARG --container-env=OMP_NUM_THREADS',
+                               'ARG --container-mounts=%s:%s:nofail+silent,%s:/y:nofail+silent' % (data, data, x),
+                               'ARG --container-env=OMP_NUM_THREADS',
                                'ARG cat', 'ARG /etc/my greeting', 'ENV OMP_NUM_THREADS=1'])
         # CS_SRUN_ARGS comes after the defaults, so it wins (srun: the later option counts)
         code, out, _ = run({'SLURM_JOB_ID': '42', 'CS_SRUN_ARGS': '--ntasks-per-node=1 -N 2'})
@@ -1775,8 +1776,11 @@ class EasyBlockSpecificTest(TestCase):
 
     def test_containerstack_missing_bind_sources(self):
         """
-        A bind whose source does not exist on the node (or is a dangling symlink) is skipped under every runtime,
-        silently unless CS_DEBUG is set (one stderr line each); the others go through as before, options and all.
+        A bind whose source does not exist here (or is a dangling symlink) is skipped by the wrapper under Apptainer
+        and enroot, which run here, silently unless CS_DEBUG is set (one stderr line each); the others go through as
+        before, options and all. Under pyxis the wrapper checks nothing: srun may run the step on other nodes (salloc
+        from a login node, -N 2), so every bind gets enroot's 'nofail' mount flag (and 'silent' unless CS_DEBUG is
+        set) and each node skips a source it lacks itself.
         """
         root, fakebin = os.path.join(self.tmpdir, 'install'), os.path.join(self.tmpdir, 'fakebin')
         for tool in ('srun', 'apptainer', 'enroot'):
@@ -1805,6 +1809,7 @@ class EasyBlockSpecificTest(TestCase):
         skipped = ['%s:%s' % (missing, missing), dangling + ':/dangling', missing + ':/m:ro',
                    '%s:%s' % (missing_odd, missing_odd)]
         kept = ['%s:%s' % (data, data), ref + ':/ref.txt:ro', odd + ':/odd']
+        normalised = [skipped[0], kept[0], skipped[1], kept[1], skipped[2], kept[2], skipped[3]]
         # the precondition: the sources the test skips are missing here, the ones it keeps exist
         self.assertEqual([os.path.exists(b.split(':')[0]) for b in binds],
                          [False, True, False, True, False, True, False])
@@ -1840,22 +1845,36 @@ class EasyBlockSpecificTest(TestCase):
             tool = {'pyxis': 'srun'}.get(runtime, runtime)
             return ['TOOL ' + tool] + args + ['ARG true', 'ENV APPTAINER_BIND=' + bind_env]
 
+        def pyxis_mounts(normalised, flags):
+            # pyxis: '+' joins mount flags; nofail after the bind's own option, if any
+            return [m + ('+' if m.count(':') == 2 else ':') + flags for m in normalised]
+
         some = wrapper('some', binds)
         for runtime, env in runtimes.items():
-            # only the binds whose source exists, in order, options kept; nothing on stderr
-            self.assertEqual(run(some, env), (expected(runtime, kept), ''), runtime)
-            # CS_DEBUG: one line per skipped bind
+            # only the binds whose source exists, in order, options kept; nothing on stderr. pyxis: all of them, each
+            # with nofail+silent
+            mounts = pyxis_mounts(normalised, 'nofail+silent')
+            mounts = mounts if runtime == 'pyxis' else kept
+            self.assertEqual(run(some, env), (expected(runtime, mounts), ''), runtime)
+            # CS_DEBUG: one line per skipped bind; pyxis: none, 'silent' dropped (enroot-mount on the node warns)
+            mounts = pyxis_mounts(normalised, 'nofail')
+            mounts = mounts if runtime == 'pyxis' else kept
             out, err = run(some, dict(env, CS_DEBUG='1'))
-            self.assertEqual(out, expected(runtime, kept), runtime)
+            self.assertEqual(out, expected(runtime, mounts), runtime)
             self.assertEqual(err, 'ContainerStack: runtime=%s\n' % runtime +
                              ''.join('ContainerStack: bind %s skipped: %s does not exist on this node\n'
-                                     % (bind, bind.split(':')[0]) for bind in skipped), runtime)
-        # none exists: no empty --bind/--container-mounts/--mount, and the user's own APPTAINER_BIND still applies
+                                     % (bind, bind.split(':')[0]) for bind in skipped if runtime != 'pyxis'),
+                             runtime)
+        # none exists: no empty --bind/--mount (pyxis: all, nofail), and the user's own APPTAINER_BIND still applies
         none = wrapper('none', [missing, dangling + ':/dangling', missing_odd + ':/m:ro'])
         for runtime, env in runtimes.items():
-            self.assertEqual(run(none, env), (expected(runtime, []), ''), runtime)
+            mounts = ['%s:%s:nofail+silent' % (missing, missing), dangling + ':/dangling:nofail+silent',
+                      missing_odd + ':/m:ro+nofail+silent'] if runtime == 'pyxis' else []
+            self.assertEqual(run(none, env), (expected(runtime, mounts), ''), runtime)
             self.assertEqual(run(none, dict(env, APPTAINER_BIND='/scratch:/scratch')),
-                             (expected(runtime, [], '/scratch:/scratch'), ''), runtime)
+                             (expected(runtime, mounts, '/scratch:/scratch'), ''), runtime)
+        # pyxis without binds: no --container-mounts
+        self.assertEqual(run(wrapper('nobinds', []), runtimes['pyxis']), (expected('pyxis', []), ''))
         self.assertEqual(run(some, {'APPTAINER_BIND': '/scratch'}), (expected('apptainer', kept, '/scratch'), ''))
         # no shell in a bind ran, in the check or the message
         self.assertEqual(sorted(os.listdir(host)), sorted(os.path.basename(p) for p in (data, ref, odd, dangling)))
