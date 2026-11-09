@@ -1124,7 +1124,8 @@ class ContainerStack(EasyBlock):
     4.2.0, enroot-mount.c: fatal unless nofail). Without 'silent' (CS_DEBUG) enroot-mount warns, but pyxis shows
     enroot's output only when the container fails to start, so a skip under pyxis gives no message; with CS_DEBUG
     the wrapper says once that the binds were passed unchecked. Under pyxis nofail also skips a bind that fails for
-    another reason, e.g. a source the user may not read.
+    another reason, e.g. a source the user may not read; and if only the read-only remount of an 'ro' bind fails,
+    the bind stays mounted writable, without a message under 'silent'.
     The quoting is unchanged: a bind is data in the wrapper, never shell.
 
     Promotion (`eb --module-only` with hidden = False) must not use --force: EasyBuild then skips the sanity check,
