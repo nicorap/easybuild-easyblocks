@@ -1709,12 +1709,17 @@ class EasyBlockSpecificTest(TestCase):
         for fmt in ('sqsh', 'sif'):
             write_file(os.path.join(root, 'image.' + fmt), '')
         write_file(os.path.join(root, 'etc', 'site.env'), '# site policy\n\nOMP_NUM_THREADS=1\n')
+        # bind sources that exist on this node (missing ones are skipped: test_containerstack_missing_bind_sources)
+        data, x = os.path.join(self.tmpdir, 'data'), os.path.join(self.tmpdir, 'x')
+        mkdir(data, parents=True)
+        mkdir(x, parents=True)
         wrapper = os.path.join(root, 'bin', 'greet')
         write_file(wrapper, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64,
-                                                          "cat '/etc/my greeting'", 'auto', ['/data', '/x:/y']))
+                                                          "cat '/etc/my greeting'", 'auto', [data, x + ':/y']))
         adjust_permissions(wrapper, stat.S_IXUSR, add=True)
         real = os.path.realpath(root)          # the wrapper resolves symlinks (macOS /var -> /private/var)
         sif, sqsh = os.path.join(real, 'image.sif'), os.path.join(real, 'image.sqsh')
+        mounts = '%s:%s,%s:/y' % (data, data, x)
 
         def run(env=None, args=()):
             full = {'PATH': fakebin + ':/usr/bin:/bin', 'CS_GPU_DEVICE': os.path.join(self.tmpdir, 'no-gpu')}
@@ -1727,13 +1732,13 @@ class EasyBlockSpecificTest(TestCase):
         code, out, err = run(args=['a b', "it's"])
         self.assertEqual(code, 0)
         self.assertEqual(err, '')
-        self.assertEqual(out, ['TOOL apptainer', 'ARG exec', 'ARG --bind', 'ARG /data:/data,/x:/y', 'ARG ' + sif,
+        self.assertEqual(out, ['TOOL apptainer', 'ARG exec', 'ARG --bind', 'ARG ' + mounts, 'ARG ' + sif,
                                'ARG cat', 'ARG /etc/my greeting', 'ARG a b', "ARG it's", 'ENV OMP_NUM_THREADS=1'])
         # in an allocation but not in a step (batch script): pyxis via srun, one task like the plain command
         code, out, err = run({'SLURM_JOB_ID': '42'})
         self.assertEqual(err, '')
         self.assertEqual(out, ['TOOL srun', 'ARG --nodes=1', 'ARG --ntasks=1', 'ARG --container-image=' + sqsh,
-                               'ARG --container-mounts=/data:/data,/x:/y', 'ARG --container-env=OMP_NUM_THREADS',
+                               'ARG --container-mounts=' + mounts, 'ARG --container-env=OMP_NUM_THREADS',
                                'ARG cat', 'ARG /etc/my greeting', 'ENV OMP_NUM_THREADS=1'])
         # CS_SRUN_ARGS comes after the defaults, so it wins (srun: the later option counts)
         code, out, _ = run({'SLURM_JOB_ID': '42', 'CS_SRUN_ARGS': '--ntasks-per-node=1 -N 2'})
@@ -1752,7 +1757,7 @@ class EasyBlockSpecificTest(TestCase):
         self.assertEqual(out[:2], ['TOOL enroot', 'ARG start'])
         self.assertEqual(out[out.index('ARG --env') + 1], 'ARG OMP_NUM_THREADS')
         self.assertFalse([a for a in out if '#' in a])
-        self.assertIn('ARG /x:/y', out)
+        self.assertIn('ARG %s:/y' % x, out)
         self.assertIn('ARG cs-tiny-1.0-aaaaaaaaaaaa', out)
         # debug output, and an unknown runtime
         _, _, err = run({'CS_DEBUG': '1'})
@@ -1767,6 +1772,93 @@ class EasyBlockSpecificTest(TestCase):
         res = subprocess.run([cs_run, 'sh', '-c', 'true'], capture_output=True, text=True,
                              env={'PATH': fakebin + ':/usr/bin:/bin', 'CS_GPU_DEVICE': '/nonexistent'})
         self.assertEqual(res.stdout.splitlines()[:5], ['TOOL apptainer', 'ARG exec', 'ARG ' + sif, 'ARG sh', 'ARG -c'])
+
+    def test_containerstack_missing_bind_sources(self):
+        """
+        A bind whose source does not exist on the node (or is a dangling symlink) is skipped under every runtime,
+        silently unless CS_DEBUG is set (one stderr line each); the others go through as before, options and all.
+        """
+        root, fakebin = os.path.join(self.tmpdir, 'install'), os.path.join(self.tmpdir, 'fakebin')
+        for tool in ('srun', 'apptainer', 'enroot'):
+            path = os.path.join(fakebin, tool)
+            write_file(path, '#!/bin/bash\necho "TOOL $(basename "$0")"\nfor a in "$@"; do echo "ARG $a"; done\n'
+                             'echo "ENV APPTAINER_BIND=${APPTAINER_BIND-unset}"\n')
+            adjust_permissions(path, stat.S_IXUSR, add=True)
+        for fmt in ('sqsh', 'sif'):
+            write_file(os.path.join(root, 'image.' + fmt), '')
+        real = os.path.realpath(root)
+        sif, sqsh = os.path.join(real, 'image.sif'), os.path.join(real, 'image.sqsh')
+        conf = os.path.join(real, containerstack.ENROOT_NO_ENTRYPOINT)
+        host = os.path.join(self.tmpdir, 'host')
+        data = os.path.join(host, 'shared data')                     # a space in the source
+        ref = os.path.join(host, 'ref.txt')                          # a file
+        odd = os.path.join(host, 'x$(touch pwned);`touch pwned`')     # shell in a name is never run
+        mkdir(data, parents=True)
+        mkdir(odd, parents=True)
+        write_file(ref, '')
+        dangling = os.path.join(host, 'dangling')                    # a symlink to nothing counts as missing
+        os.symlink(os.path.join(host, 'gone'), dangling)
+        missing = os.path.join(host, 'missing')
+        missing_odd = os.path.join(host, 'm$(touch pwned) x')
+        binds = [missing, data, dangling + ':/dangling', ref + ':/ref.txt:ro', missing + ':/m:ro', odd + ':/odd',
+                 missing_odd]
+        skipped = ['%s:%s' % (missing, missing), dangling + ':/dangling', missing + ':/m:ro',
+                   '%s:%s' % (missing_odd, missing_odd)]
+        kept = ['%s:%s' % (data, data), ref + ':/ref.txt:ro', odd + ':/odd']
+        # the precondition: the sources the test skips are missing here, the ones it keeps exist
+        self.assertEqual([os.path.exists(b.split(':')[0]) for b in binds],
+                         [False, True, False, True, False, True, False])
+        self.assertTrue(os.path.islink(dangling))
+
+        def wrapper(name, binds):
+            path = os.path.join(root, 'bin', name)
+            write_file(path, containerstack.render_wrapper('tiny', '1.0', 'sha256:' + 'a' * 64, 'true', 'auto', binds))
+            adjust_permissions(path, stat.S_IXUSR, add=True)
+            return path
+
+        def run(path, env):
+            full = {'PATH': fakebin + ':/usr/bin:/bin', 'CS_GPU_DEVICE': '/nonexistent'}
+            full.update(env)
+            res = subprocess.run([path], env=full, cwd=host, capture_output=True, text=True, timeout=60)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            return res.stdout.splitlines(), res.stderr
+
+        runtimes = {'apptainer': {}, 'pyxis': {'SLURM_JOB_ID': '42'}, 'enroot': {'CS_RUNTIME': 'sqsh'}}
+        cname = 'ARG cs-tiny-1.0-aaaaaaaaaaaa'
+
+        def expected(runtime, mounts, bind_env='unset'):
+            if runtime == 'apptainer':
+                args = ['ARG exec'] + (['ARG --bind', 'ARG ' + ','.join(mounts)] if mounts else []) + ['ARG ' + sif]
+            elif runtime == 'pyxis':
+                args = ['ARG --nodes=1', 'ARG --ntasks=1', 'ARG --container-image=' + sqsh]
+                args += ['ARG --container-mounts=' + ','.join(mounts)] if mounts else []
+            else:
+                args = ['ARG start', 'ARG --conf', 'ARG ' + conf]
+                for mount in mounts:
+                    args += ['ARG --mount', 'ARG ' + mount]
+                args.append(cname)
+            tool = {'pyxis': 'srun'}.get(runtime, runtime)
+            return ['TOOL ' + tool] + args + ['ARG true', 'ENV APPTAINER_BIND=' + bind_env]
+
+        some = wrapper('some', binds)
+        for runtime, env in runtimes.items():
+            # only the binds whose source exists, in order, options kept; nothing on stderr
+            self.assertEqual(run(some, env), (expected(runtime, kept), ''), runtime)
+            # CS_DEBUG: one line per skipped bind
+            out, err = run(some, dict(env, CS_DEBUG='1'))
+            self.assertEqual(out, expected(runtime, kept), runtime)
+            self.assertEqual(err, 'ContainerStack: runtime=%s\n' % runtime +
+                             ''.join('ContainerStack: bind %s skipped: %s does not exist on this node\n'
+                                     % (bind, bind.split(':')[0]) for bind in skipped), runtime)
+        # none exists: no empty --bind/--container-mounts/--mount, and the user's own APPTAINER_BIND still applies
+        none = wrapper('none', [missing, dangling + ':/dangling', missing_odd + ':/m:ro'])
+        for runtime, env in runtimes.items():
+            self.assertEqual(run(none, env), (expected(runtime, []), ''), runtime)
+            self.assertEqual(run(none, dict(env, APPTAINER_BIND='/scratch:/scratch')),
+                             (expected(runtime, [], '/scratch:/scratch'), ''), runtime)
+        self.assertEqual(run(some, {'APPTAINER_BIND': '/scratch'}), (expected('apptainer', kept, '/scratch'), ''))
+        # no shell in a bind ran, in the check or the message
+        self.assertEqual(sorted(os.listdir(host)), sorted(os.path.basename(p) for p in (data, ref, odd, dangling)))
 
     def test_containerstack_pyxis_inside_step(self):
         """CS_RUNTIME=pyxis inside a job step fails at once: a nested srun would wait for this step's resources."""
